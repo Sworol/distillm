@@ -134,7 +134,7 @@ Script: `run_multitask_experiment.sh`
 - [x] Paper comparison
 - [x] Download SINST/UINST training splits
 - [x] Merge + tokenize combined training data (62,553 items)
-- [ ] Multi-task: Teacher SFT (script ready: `run_multitask_experiment.sh`)
+- [/] Multi-task: Teacher SFT — **running** (bs=4, ~37K steps, ~1 day)
 - [ ] Multi-task: Student Init
 - [ ] Multi-task: DistiLLM
 - [ ] Multi-task: 5-benchmark re-evaluation
