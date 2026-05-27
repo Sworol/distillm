@@ -287,8 +287,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             torch.cuda.synchronize()
             st_time = time.time()
             
-            # # sampling ratio:
-            samp_threshold = adaptive_threshold * (1 - global_step / args.total_iters)
+            # sampling ratio (only meaningful for adaptive variants)
+            if "adaptive" in args.type and adaptive_threshold is None:
+                raise ValueError("adaptive_threshold is None but args.type includes 'adaptive'.")
+
+            samp_threshold = 0.0 if adaptive_threshold is None else adaptive_threshold * (1 - global_step / args.total_iters)
             if "adaptive" in args.type:
                 if args.replay_ratio == "constant":
                     samp_threshold = adaptive_threshold * 0.5
