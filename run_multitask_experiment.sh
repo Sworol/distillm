@@ -78,7 +78,12 @@ run_stage \
     --do-sample --top-k 0 --top-p 1.0 --temperature 1.0
 
 TEACHER_RUN_DIR="${BASE_PATH}/results/gpt2/train/sft_multitask/e10-bs2-lr5e-05-G1-N4-NN1"
-TEACHER_CKPT="${TEACHER_RUN_DIR}/74441"
+TEACHER_CKPT="$(ls -d ${TEACHER_RUN_DIR}/*/ 2>/dev/null | sort -V | tail -n 1)"
+if [ -z "${TEACHER_CKPT}" ]; then
+    echo "ERROR: Teacher checkpoint not found in ${TEACHER_RUN_DIR}"
+    exit 1
+fi
+echo "Teacher checkpoint: ${TEACHER_CKPT}"
 echo "[1/3] Teacher SFT done. Checkpoint: ${TEACHER_CKPT}"
 
 # ============================================================
@@ -121,8 +126,13 @@ run_stage \
     --type lm \
     --do-sample --top-k 0 --top-p 1.0 --temperature 1.0
 
-STUDENT_RUN_DIR="$(ls -dt ${BASE_PATH}/results/gpt2/train/init_multitask/gpt2-base/e3-* 2>/dev/null | head -n 1)"
-STUDENT_CKPT="$(ls -d ${STUDENT_RUN_DIR}/*/ 2>/dev/null | sort -t '/' -k1,1 -V | tail -n 1)"
+STUDENT_RUN_DIR="$(ls -dt ${BASE_PATH}/results/gpt2/train/init_multitask/e3-* 2>/dev/null | head -n 1)"
+STUDENT_CKPT="$(ls -d ${STUDENT_RUN_DIR}/*/ 2>/dev/null | sort -V | tail -n 1)"
+if [ -z "${STUDENT_CKPT}" ]; then
+    echo "ERROR: Student checkpoint not found in ${STUDENT_RUN_DIR}"
+    exit 1
+fi
+echo "Student checkpoint: ${STUDENT_CKPT}"
 echo "[2/3] Student Init done. Checkpoint: ${STUDENT_CKPT}"
 
 # ============================================================
