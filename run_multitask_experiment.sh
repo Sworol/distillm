@@ -52,7 +52,7 @@ run_stage \
     --num-workers 4 \
     --dev-num 3000 \
     --lr 0.00005 \
-    --batch-size 2 \
+    --batch-size 4 \
     --eval-batch-size 8 \
     --gradient-accumulation-steps 1 \
     --warmup-iters 0 \
@@ -77,7 +77,7 @@ run_stage \
     --type lm \
     --do-sample --top-k 0 --top-p 1.0 --temperature 1.0
 
-TEACHER_RUN_DIR="${BASE_PATH}/results/gpt2/train/sft_multitask/e10-bs2-lr5e-05-G1-N4-NN1"
+TEACHER_RUN_DIR="${BASE_PATH}/results/gpt2/train/sft_multitask/e10-bs4-lr5e-05-G1-N4-NN1"
 TEACHER_CKPT="$(ls -d ${TEACHER_RUN_DIR}/*/ 2>/dev/null | sort -V | tail -n 1)"
 if [ -z "${TEACHER_CKPT}" ]; then
     echo "ERROR: Teacher checkpoint not found in ${TEACHER_RUN_DIR}"
