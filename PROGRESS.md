@@ -119,11 +119,23 @@ Script: `run_multitask_experiment.sh`
 
 2. **Eval data format**: `evaluate_main` expects JSONL with `{"prompt": "...", "output": "..."}` fields.
 
-3. **GPU memory**: Other processes (`ader` env) occupy ~7.7GB per GPU. Use `CUDA_VISIBLE_DEVICES=3` for eval.
+3. **GPU memory**: Other processes (`ader` env) occupy ~7.7GB per GPU. Use `CUDA_VISIBLE_DEVICES=3` for eval. Kill conflicting processes before full training to free up memory.
 
 4. **Data leakage in Dolly eval**: All 15K Dolly items were used for training. Use training dev set (held-out 1000) for fair comparison.
 
 5. **torchrun path**: Must use `/anaconda3/envs/llm_train/bin/torchrun` (not system `torchrun` which points to `openmmlab` env).
+
+6. **GPU OOM with multi-task Teacher SFT**: gpt2-xlarge (1.5B) with batch_size=2 on combined 60K data OOMed when other processes used ~7.5GB per GPU. Reduced to batch_size=1+grad_acc=2. After killing other processes and freeing full 24GB, batch_size=4 works safely.
+
+7. **Disk full crash**: `results/` accumulated 91GB (old SFT had 10 intermediate 3GB checkpoints per epoch). Cleaned up: deleted debug runs (38G+), removed 9 intermediate checkpoints (27G), kept only final checkpoint. Freed 81G.
+
+8. **Stage 2 eval crash (post-training)**: `finetune.py` eval after training attempts to load model from `{ckpt_dir}/eval/` but it lacks `config.json`. Training checkpoint is valid — this is an eval-only bug. Workaround: skip eval, manually launch next stage.
+
+9. **Residual GPU processes**: After killing training, Python processes may not release GPU memory immediately. Use `nvidia-smi` to verify, then `kill -9` residual PIDs.
+
+10. **SINST output format**: SINST data has `output` as list (e.g., `['Response 2']`) not string. Must convert before tokenization with `process_data_dolly.py`.
+
+11. **`.gitignore` pattern syntax**: `./results/` doesn't work — use `/results/` to anchor to repo root.
 
 ## Remaining
 
@@ -134,9 +146,9 @@ Script: `run_multitask_experiment.sh`
 - [x] Paper comparison
 - [x] Download SINST/UINST training splits
 - [x] Merge + tokenize combined training data (62,553 items)
-- [/] Multi-task: Teacher SFT — **running** (bs=4, ~37K steps, ~1 day)
-- [ ] Multi-task: Student Init
-- [ ] Multi-task: DistiLLM
+- [x] Multi-task: Teacher SFT (10 epoch, ckpt `sft_multitask/.../37220`)
+- [x] Multi-task: Student Init (3 epoch, ckpt `init_multitask/.../5583`)
+- [/] Multi-task: DistiLLM — **running** (20 epoch, adaptive-sfkl, log: `logs/stage3_distillm.log`)
 - [ ] Multi-task: 5-benchmark re-evaluation
 - [ ] KD baseline training (script ready: `scripts/run_kd_baseline.sh`)
 - [ ] SeqKD baseline (needs teacher data generation)
