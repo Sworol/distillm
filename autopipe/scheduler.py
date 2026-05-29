@@ -276,12 +276,16 @@ def main() -> None:
                         patch_exp(run_exp_path, base=queue_exp, status="aborted", updated_at=now_ts())
                         continue
                 if status == "aborted":
-                    # Allow re-running an aborted experiment after updating queue/run config.
-                    # This keeps the pipeline "hands-off" even if a previous run hit the
-                    # retry ceiling; users can fix the root cause and re-run without manual
-                    # JSON surgery.
-                    attempt = 0
-                    status = "failed"
+                    # Only auto-retry an aborted experiment if the underlying config has been
+                    # modified (e.g., a hotfix). Otherwise, require manual intervention.
+                    qmtime = exp_path.stat().st_mtime if exp_path.exists() else 0
+                    rmtime = run_exp_path.stat().st_mtime if run_exp_path.exists() else 0
+                    if qmtime > rmtime:
+                        # Queue config was updated — retry is likely intentional.
+                        attempt = 0
+                        status = "failed"
+                    else:
+                        continue  # no changes detected, keep aborted
 
                 # Ensure per-exp working config exists.
                 if not run_exp_path.exists():
@@ -316,6 +320,7 @@ def main() -> None:
                         "oom_batch_candidates",
                         "max_retries",
                         "agent_cli",
+                        "hard_failure_threshold",
                     ]
                     changed = False
                     for k in merge_keys:
