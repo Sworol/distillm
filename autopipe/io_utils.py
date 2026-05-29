@@ -118,6 +118,10 @@ def classify_failure(log_path: Path) -> str:
         return "oom"
     if "loss scale" in combined and ("minimum" in combined or "cannot decrease" in combined):
         return "loss_scale"
+    if "nan" in combined and ("loss" in combined or "gradient" in combined or "tensor" in combined):
+        return "nan"
+    if "no space left on device" in combined or "disk full" in combined:
+        return "disk_full"
     if "huggingface.co" in combined and ("timeout" in combined or "timed out" in combined or "rate limit" in combined):
         return "hf"
     if "temporary failure in name resolution" in combined or "connection reset by peer" in combined:
@@ -130,6 +134,17 @@ def classify_failure(log_path: Path) -> str:
         return "nccl"
     if "filenotfounderror" in combined or "no such file or directory" in combined:
         return "path"
+    if "jsondecodeerror" in combined or ("keyerror" in combined and ("json" in combined or "data" in combined)):
+        return "data"
+    if ("size mismatch" in combined or "expected size" in combined or "mat1 and mat2" in combined
+            or "invalid shape" in combined):
+        return "shape"
+    if "assertionerror" in combined or "assert" in combined:
+        return "assert"
+    if "sigterm" in combined or "keyboardinterrupt" in combined or "process killed" in combined:
+        return "killed"
+    if "checkpoint" in combined and ("missing" in combined or "unexpected" in combined or "size mismatch" in combined):
+        return "ckpt"
 
     return "other"
 

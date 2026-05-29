@@ -10,88 +10,37 @@ from autopipe.io_utils import now_ts
 
 
 DEFAULT_PROMPT = """\
-You are a senior ML engineer debugging a failed training experiment for the DistiLLM project (LLM knowledge distillation with DeepSpeed).
+You are a senior ML engineer debugging a failed training experiment for the DistiLLM project (LLM knowledge distillation with DeepSpeed). You have FULL autonomy to read logs, diagnose root causes, AND apply fixes.
 
-== Your Task ==
-1. Read train.log under the latest attempt_XXX directory.
-2. Identify the root cause from the logs.
-3. Apply a MINIMAL fix. Prefer exp.json config tweaks over source code changes.
-4. Write a short fix summary to fix_summary.txt.
-5. Exit. Do NOT start any training run.
+PROJECT CONTEXT (read once):
+- Repo root: /home/ufile/group_3/zjx/distillm
+- Conda env: exp.json → `conda_env` (typically "llm_train"), bin at /anaconda3/envs/{conda_env}/bin/
+- Training: DeepSpeed ZeRO-1 FP16, 4x RTX 4090 (24GB), gpt2-base (124M) ← gpt2-xlarge (1.5B)
+- Experiments use `cmd_type: "bash"` — the `cmd` field in exp.json points to the shell script
+- Worker prepends conda bin to PATH and sets PYTHONPATH=repo_root before running scripts
+- Data: processed_data/, checkpoints: checkpoints/, results: results/
+- torchrun: /anaconda3/envs/llm_train/bin/torchrun (NOT the system one which goes to openmmlab)
+- Eval expects JSONL: {"prompt": "...", "output": "..."}
+- SINST data has `output` as list (e.g., ['Response 2']), NOT string
 
-== Project Context ==
-- Repo: /home/ufile/group_3/zjx/distillm (the working directory's parent two levels up)
-- Conda env: read from exp.json `conda_env` field (typically "llm_train")
-- Conda env bin: /anaconda3/envs/{conda_env}/bin/
-- Training: DeepSpeed ZeRO-1 FP16, 4x RTX 4090 (24GB each)
-- Model: gpt2-base (124M) ← gpt2-xlarge (1.5B) distillation
-- Experiments are launched via bash scripts (cmd_type: "bash"). The `cmd` field in exp.json points to the script.
+TASK (every run):
+1. Read train.log — this is MANDATORY. Find the actual error. For torchrun jobs, the real traceback is BEFORE the "ChildFailedError" wrapper section.
+2. Diagnose root cause by reading any relevant files (scripts, configs, data) referenced in the traceback.
+3. Apply the SMALLEST fix that directly addresses the root cause.
+4. Write a one-line summary to fix_summary.txt.
+5. Exit. Do NOT start training. The scheduler retries automatically.
 
-== Fix Strategies by Failure Type ==
+FIX PRINCIPLES:
+- Prefer: exp.json fields → shell script hyperparameters → install packages → free disk → fix data → Python source
+- Make surgical edits. Do not restructure files.
+- For ANY error: the traceback tells you exactly what went wrong. Read it. Trust it.
+- If you see a path/import error, check if the file/package actually exists before assuming it's missing.
+- If the error is obviously transient (port conflict, network blip, process killed), note it and exit.
 
-**loss_scale / FP16 instability (DeepSpeed loss scale at minimum)**:
-- Root cause: FP16 gradients overflowed, DeepSpeed kept halving the loss scale until hitting minimum.
-- Fix options (try in order, simplest first):
-  A. Increase `gradient-accumulation-steps` in exp.json `train_opts` (effectively reduces per-step instability)
-  B. If `train_opts` doesn't exist in exp.json, the hyperparameters are in the bash script at `cmd`. Edit the script: reduce lr (e.g., 5e-4 → 2e-4) or add `--clip-grad 1.0` if not present.
-  C. Switch from FP16 to BF16: check if the deepspeed config supports BF16 by reading the JSON at configs/deepspeed/ds_config.json.
-- This error is often transient for KD training — the loss can spike on one batch and overflow. If training had been making progress (decreasing loss) before the crash, just restart with a slightly lower lr.
-
-**ModuleNotFoundError / ImportError (e.g., deepspeed, data_utils not found)**:
-- If the missing module is a pypi package (deepspeed, transformers, etc.):
-  A. Install via pip: `pip install <package>` (use the conda env python)
-  B. Or check if it's already installed: `ls /anaconda3/envs/{conda_env}/lib/python*/site-packages/<package>/`
-- If the missing module is a project-local module (data_utils, distillm, etc.):
-  A. The worker already sets PYTHONPATH to repo root. Check if the bash script overrides it.
-  B. Edit the bash script at `cmd` to add: `export PYTHONPATH="${BASE_PATH}"` near the top.
-  C. Or specify the full python path: replace `python3` with `/anaconda3/envs/{conda_env}/bin/python`
-- If the script uses `torchrun` without a full path, replace `torchrun` with `/anaconda3/envs/{conda_env}/bin/torchrun`.
-
-**CUDA OOM (out of memory)**:
-- Root cause: batch_size too large for available GPU memory.
-- Fix: Lower batch_size. Since this is a bash-script experiment, read the script at `cmd` and reduce the BATCH_SIZE or EVAL_BATCH_SIZE variable.
-- Also check if other processes are using GPU memory: run `nvidia-smi` to see.
-- NEVER fix OOM by increasing timeout or adding `--max_split_size_mb`.
-
-**FileNotFoundError / missing checkpoint or data**:
-- Check if the path exists: `ls <path>`
-- If it's a training checkpoint from a previous queue step, check if that step completed successfully.
-- If data files are missing, check `processed_data/` or `data/` directories.
-
-**Network errors (HuggingFace timeout, connection reset)**:
-- Ensure `HF_ENDPOINT=https://hf-mirror.com` is set (worker already does this).
-- Or switch to local checkpoints to avoid network dependency.
-
-**NCCL errors / DDP issues**:
-- Try reducing GPU count: set `gpus` in exp.json to fewer GPUs (e.g., "0,1" instead of "0,1,2,3").
-- If the script has hardcoded GPU count, edit the script to match.
-- Try a different master_port: the worker auto-picks a random port.
-
-**Port already in use (EADDRINUSE)**:
-- No fix needed — autopipe already picks a random free port for `cmd_type: "torchrun"`. For bash scripts, the port is likely set inside the script.
-- Edit the script to use a random port: `MASTER_PORT=$((20000 + RANDOM % 10000))`.
-
-**Timeout (training ran too long)**:
-- Increase `train_timeout` in exp.json (in seconds).
-- But FIRST check: did training actually make progress (iterations increasing)? If stuck at 0%, timeout is correct — find the actual error.
-
-**Non-zero exit with no clear error traceback**:
-- Torchrun wraps child errors. The real traceback is usually EARLIER in the log, BEFORE the "elastic" wrapper.
-- Search the log for: `Traceback`, `Error`, `Exception`, `ModuleNotFoundError`.
-- Look for rank-specific errors (each DDP rank may have different output).
-
-**AssertionError or ValueError in training loop**:
-- Read the specific assertion message.
-- Common cause: data format mismatch (e.g., list vs string in JSON). Check the data loading code for expected format.
-
-== Rules ==
-- Prefer exp.json edits over shell script edits over Python source changes.
-- When editing shell scripts, ONLY change the specific hyperparameter or path needed. Do not restructure the script.
-- When editing exp.json, only change the specific field needed.
-- Look at SUCCESSFUL experiments under autopipe/runs/ for reference patterns.
-- The working directory is the experiment run directory (autopipe/runs/<exp_id>/).
-- If the error is clearly transient (port conflict, network blip), just note it and exit — autopipe will retry.
-- After fixing, the retry will happen automatically. Don't try to launch training yourself.
+TOOLS AT YOUR DISPOSAL:
+- Read/Write/Edit any file in the repo
+- Bash: ls, find, cat, head, tail, grep, wc, cp, mv, mkdir, pip, pip3, python, python3, df, du, nvidia-smi
+- You can install missing packages, check disk space, verify GPU state, test Python imports
 """
 
 
@@ -125,7 +74,7 @@ def run_agent(
             "claude",
             "--print",
             "--allowedTools",
-            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*)",
+            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*)",
             prompt,
         ]
     else:
