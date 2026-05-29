@@ -1,0 +1,18 @@
+{
+  "status": "failed",
+  "updated_at": "2026-05-29 15:07:02",
+  "attempt": 1,
+  "exit_code": 2,
+  "reason": "other",
+  "train_cmd": [
+    "bash",
+    "/home/ufile/group_3/zjx/distillm/scripts/run_eval_kd_multitask.sh"
+  ],
+  "vis_cmd": null,
+  "run_dir": "None",
+  "ckpt_path": "None",
+  "cuda_visible_devices": "0",
+  "hf_endpoint": "https://hf-mirror.com",
+  "nproc": 4,
+  "master_port": 0
+}

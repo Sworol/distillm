@@ -1,0 +1,16 @@
+{
+  "exp_id": "seqkd_gen_1cb0aa2e",
+  "key": "seqkd_gen",
+  "cmd_type": "bash",
+  "cmd": "/home/ufile/group_3/zjx/distillm/scripts/gpt2/tools/generate_data_seqkd_multitask.sh",
+  "created_at": "2026-05-29 14:33:52",
+  "status": "pending",
+  "attempt": 0,
+  "max_retries": 0,
+  "retry_sleep": 60,
+  "gpus": "0,1,2,3",
+  "train_timeout": 172800,
+  "skip_vis": true,
+  "conda_env": "llm_train",
+  "hard_failure_threshold": 0
+}

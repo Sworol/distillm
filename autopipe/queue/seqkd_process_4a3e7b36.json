@@ -1,0 +1,16 @@
+{
+  "exp_id": "seqkd_process_4a3e7b36",
+  "key": "seqkd_process",
+  "cmd_type": "bash",
+  "cmd": "/home/ufile/group_3/zjx/distillm/scripts/process_seqkd_data.sh",
+  "created_at": "2026-05-29 14:33:52",
+  "status": "pending",
+  "attempt": 0,
+  "max_retries": 1,
+  "retry_sleep": 60,
+  "gpus": "",
+  "train_timeout": 3600,
+  "skip_vis": true,
+  "conda_env": "llm_train",
+  "hard_failure_threshold": 0
+}

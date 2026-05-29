@@ -3,6 +3,7 @@
 ## Project Structure & Module Organization
 - `distillm/`: core distillation implementation (training loops, utilities used by scripts).
 - `minillm/`: upstream baseline components this repo builds on (MiniLLM-style training/distillation).
+- `autopipe/`: lightweight experiment orchestration (queue-based scheduler + worker for batch-running baselines).
 - `data_utils/` and `tools/`: dataset prep, tokenization, and helper scripts (e.g., OpenWebText utilities).
 - `scripts/`: runnable experiment entrypoints grouped by model family (`gpt2/`, `opt/`, `openllama2/`) and task (`sft/`, `kd/`, `distillm/`, `eval/`, `tools/`).
 - `configs/`: configuration files used by training/eval.

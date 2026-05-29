@@ -1,0 +1,16 @@
+{
+  "exp_id": "seqkd_eval_08165d50",
+  "key": "seqkd_eval",
+  "cmd_type": "bash",
+  "cmd": "/home/ufile/group_3/zjx/distillm/scripts/run_eval_seqkd_multitask.sh",
+  "created_at": "2026-05-29 14:33:52",
+  "status": "pending",
+  "attempt": 0,
+  "max_retries": 1,
+  "retry_sleep": 60,
+  "gpus": "0",
+  "train_timeout": 86400,
+  "skip_vis": true,
+  "conda_env": "llm_train",
+  "hard_failure_threshold": 0
+}

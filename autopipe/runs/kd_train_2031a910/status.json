@@ -1,0 +1,15 @@
+{
+  "status": "running",
+  "updated_at": "2026-05-29 15:07:32",
+  "attempt": 1,
+  "exp_id": "kd_train_2031a910",
+  "cfg_path": null,
+  "trainer": null,
+  "train_cmd": [
+    "bash",
+    "/home/ufile/group_3/zjx/distillm/scripts/run_kd_multitask.sh"
+  ],
+  "cuda_visible_devices": "0,1,2,3",
+  "hf_endpoint": "https://hf-mirror.com",
+  "cmd_type": "bash"
+}

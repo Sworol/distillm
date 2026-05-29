@@ -60,8 +60,49 @@ All training/eval is launched via shell scripts organized as `scripts/{model_fam
 - DistiLLM / SFT / KD: select best checkpoint by **ROUGE-L** score
 - Student initialization (init): select best checkpoint by **validation loss**
 
+## autopipe — Experiment Orchestration
+
+The `autopipe/` module (adapted from Ader project) provides a lightweight queue-based pipeline runner. It manages long-running experiments without manual intervention.
+
+### How it works
+1. `make_queue.py` → generates JSON queue entries in `autopipe/queue/`
+2. `scheduler.py` → polls queue, picks `pending` items, spawns workers
+3. `worker.py` → runs a single experiment (bash script or torchrun), records success/failed
+4. On failure: exponential backoff retry, OOM batch-size auto-reduction, optional LLM agent repair
+
+### Usage
+```bash
+# Generate experiment queue
+cd /home/ufile/group_3/zjx/distillm
+python3 -m autopipe.make_queue --repo-root .
+
+# Start scheduler (poll every 30s, run 1 experiment at a time)
+python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-parallel 1
+```
+
+### Experiment JSON format (for `cmd_type: "bash"`)
+```json
+{
+  "exp_id": "kd_train_xxx",
+  "key": "kd_train",
+  "cmd_type": "bash",
+  "cmd": "/path/to/script.sh",
+  "conda_env": "llm_train",
+  "gpus": "0,1,2,3",
+  "train_timeout": 86400,
+  "skip_vis": true,
+  "max_retries": 1,
+  "retry_sleep": 60
+}
+```
+
+### Artifacts
+- Queue: `autopipe/queue/<exp_id>.json`
+- Run artifacts: `autopipe/runs/<exp_id>/attempt_XXX/` (train.log, exp.json, status.json)
+- Scheduler log: `autopipe/logs/scheduler_<exp_id>.log`
+
 ## Key dependencies
-- PyTorch 2.1.2 with CUDA 12.1
-- transformers 4.42.4 (was pinned to a specific commit following MiniLLM)
-- DeepSpeed (ZeRO-1 or ZeRO-2 with FP16)
-- vLLM 0.5.0, PEFT, accelerate, rouge-score, datasets
+- conda env `llm_train` with PyTorch 2.4.0, CUDA 12.4
+- transformers 4.43.4
+- DeepSpeed (ZeRO-1 with FP16)
+- rouge-score, datasets, accelerate, PEFT

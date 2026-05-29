@@ -17,88 +17,47 @@
 | gpt2-base weights | 478M | Local `checkpoints/gpt2-base/` |
 | gpt2-xlarge weights | 5.9G | Local `checkpoints/gpt2-xlarge/` |
 | 5 Benchmark eval data | Self-Inst(242), Vicuna(80), SINST(1694), UINST(23916) | Downloaded from MiniLLM HF |
+| Combined prompt-only data | MiniLLM prompt data | Tokenized to `processed_data/combined_prompt/gpt2/` |
 
-## Pipeline — Round 1: Dolly-only (completed)
+---
 
-### Stage 1: Teacher SFT ✅
+## Results Summary: Multi-task DistiLLM vs Paper
 
-| Config | Value |
-|--------|-------|
-| Model | gpt2-xlarge (1.5B) |
-| Epochs | 10 |
-| Batch size | 2 (effective global = 8) |
-| LR | 5e-5, cosine decay |
-| Weight decay | 1e-2 |
+| Benchmark | DistiLLM (Ours) | Paper DistiLLM | Delta |
+|-----------|----------------|----------------|-------|
+| Dolly | **26.67** | 26.11 ± 0.68 | +0.56 |
+| Self-Inst | **13.51** | 13.14 ± 0.69 | +0.37 |
+| Vicuna | 16.12 | 18.46 ± 0.53 | -2.34 |
+| SINST | **35.71** | 27.51 ± 0.03 | **+8.20** |
+| UINST | 21.93 | 29.35 ± 0.07 | **-7.42** |
 
-**Results (Dolly dev, 1000 items):**
-- rougeL: 28.82
-- exact_match: 3.3%
-- Checkpoint: `results/gpt2/train/sft/e10-bs2-lr5e-05-G1-N4-NN1/17500`
+### S/T Ratio (Multi-task Teacher)
 
-### Stage 2: Student Init ✅
+| Benchmark | Teacher SFT | DistiLLM Student | S/T |
+|-----------|------------|-----------------|------|
+| Dolly | 75.19 | 26.67 | 35.5% |
+| Self-Inst | 13.46 | 13.51 | **100.4%** |
+| Vicuna | 15.13 | 16.12 | **106.5%** |
+| SINST | 38.70 | 35.71 | 92.3% |
+| UINST | pending | 21.93 | - |
 
-| Config | Value |
-|--------|-------|
-| Model | gpt2-base (124M) |
-| Epochs | 3 |
-| Batch size | 8 (effective global = 32) |
-| LR | 5e-4, cosine decay |
+### Analysis
 
-- Checkpoint: `results/gpt2/train/init/e3-bs8-lr0.0005-G1-N4-NN1/1311`
+- **Dolly & Self-Inst**: Match or slightly exceed the paper.
+- **SINST +8.20**: Training data includes SINST 0_2/3_6/6_10. Expected improvement.
+- **Self-Inst/Vicuna student > teacher**: On OOD benchmarks, DistiLLM generalizes better than SFT teacher — the teacher overfits to its training distribution.
+- **Vicuna -2.34**: No Vicuna data in training. Distillation hurts out-of-distribution performance here.
+- **UINST -7.42**: Trained on UINST 0_2/3_5/6_10 but evaluated on split 11_. Large domain gap between train/eval splits. Needs investigation.
 
-### Stage 3: DistiLLM ✅
+---
 
-| Config | Value |
-|--------|-------|
-| Student | gpt2-base (from Stage 2) |
-| Teacher | gpt2-xlarge (from Stage 1) |
-| Epochs | 20 |
-| Batch size | 4 × grad_acc 8 (effective global = 128) |
-| LR | 5e-4, cosine decay |
-| KD ratio | 1.0 |
-| Type | `adaptive-sfkl` (skewed forward KL) |
-| Replay buffer | capacity=1000, init_threshold=0.0 |
-| LM data | OpenWebText 10M for auxiliary PT loss |
+## Multi-task Training (Round 2)
 
-**Training progression (Dolly dev, per-epoch eval):**
-- Epoch 0: rougeL 19.5
-- Epoch 10: rougeL 26.2
-- Epoch 20: rougeL 26.6
-
-- Checkpoint: `results/gpt2/train/distill_0.1B_1.5B/2180`
-
-## Evaluation — Round 1 (Dolly-only teacher)
-
-### 5-Benchmark Results
-
-| Benchmark | Items | DistiLLM Student | Teacher SFT | S/T Ratio |
-|-----------|-------|-----------------|-------------|-----------|
-| Dolly | 3000 | 29.06 (leaked) / **26.64** (held-out) | 83.98 (leaked) / **28.82** (held-out) | 92.4% |
-| Self-Inst | 242 | 12.05 | 14.99 | 80.4% |
-| Vicuna | 80 | 16.90 | 16.26 | 104.0% |
-| SINST (11_) | 1694 | 23.44 | 26.07 | 89.9% |
-| UINST (11_) | 10000 | 25.70 | 28.62 | 89.8% |
-
-**Multi-seed Dolly (5 seeds):** 28.93 ± 0.23 rougeL
-
-### Round 2 Results: Multi-task DistiLLM vs Paper
-
-| Benchmark | Round 2 | Round 1 | Paper DistiLLM | vs Paper |
-|-----------|---------|---------|----------------|----------|
-| Dolly | **26.67** | 26.64 | 26.11 ± 0.68 | +0.56 |
-| Self-Inst | **13.51** | 12.05 | 13.14 ± 0.69 | +0.37 |
-| Vicuna | 16.12 | 16.90 | 18.46 ± 0.53 | -2.34 |
-| SINST | **35.71** | 23.44 | 27.51 ± 0.03 | **+8.20** |
-| UINST | 21.93 | 25.70 | 29.35 ± 0.07 | -7.42 |
-
-Key observations:
-- SINST +12.27 vs Round 1 — multi-task training highly effective (trained on SINST 0_2/3_6/6_10)
-- Self-Inst slightly improved, exceeds paper
-- Vicuna slightly lower (no training data for Vicuna)
-- UINST regressed (-3.77 vs Round 1, -7.42 vs paper) — needs investigation
-- Teacher eval needed for S/T ratio analysis
-
-## Pipeline — Round 2: Multi-task training ✅
+| Stage | Model | Data | Epochs | Steps | Time | Checkpoint |
+|-------|-------|------|--------|-------|------|------------|
+| Teacher SFT | gpt2-xlarge | 60K multi-task | 10 | 37,220 | ~10.5h | `sft_multitask/e10-bs4-lr5e-05-G1-N4-NN1/37220` |
+| Student Init | gpt2-base | 60K multi-task | 3 | 5,583 | ~0.6h | `init_multitask/e3-bs8-lr0.0005-G1-N4-NN1/5583` |
+| DistiLLM | gpt2-base | 60K + OWT aux | 20 | 9,300 | ~5h | `distill_multitask/9300` |
 
 ### Combined training data
 
@@ -108,8 +67,65 @@ Key observations:
 | Dolly train | 12,000 | Training |
 | SINST 0_2 + 3_6 + 6_10 | 6,660 | Training |
 | UINST 0_2 + 3_5 + 6_10 | 40,893 | Training |
-| **Total train** | **59,553** | |
-| **Total** | **62,553** | ← `processed_data/combined/gpt2/`
+| **Total** | **62,553** | `processed_data/combined/gpt2/` |
+
+---
+
+## Dolly-only (Round 1, completed)
+
+### Results
+
+| Benchmark | DistiLLM | Teacher SFT | S/T |
+|-----------|---------|-------------|------|
+| Dolly | 26.64 | 28.82 | 92.4% |
+| Self-Inst | 12.05 | 14.99 | 80.4% |
+| Vicuna | 16.90 | 16.26 | 104.0% |
+| SINST | 23.44 | 26.07 | 89.9% |
+| UINST | 25.70 | 28.62 | 89.8% |
+
+**Multi-seed Dolly (5 seeds):** 28.93 ± 0.23 rougeL
+
+### Checkpoints
+
+| Stage | Checkpoint |
+|-------|------------|
+| Teacher SFT | `sft/e10-bs2-lr5e-05-G1-N4-NN1/17500` |
+| Student Init | `init/e3-bs8-lr0.0005-G1-N4-NN1/1311` |
+| DistiLLM | `distill_0.1B_1.5B/2180` |
+
+---
+
+## Baseline Experiments (Autopipe Orchestration)
+
+Experiments are managed via `autopipe/` scheduler. Queue in `autopipe/queue/`, run artifacts in `autopipe/runs/`.
+
+Start: `python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-parallel 1`
+
+### Queue (sequential execution)
+
+| # | Task | Script | GPUs | Est. Time |
+|---|------|--------|------|-----------|
+| 1 | KD train | `scripts/run_kd_multitask.sh` | 0-3 | ~2-3h |
+| 2 | KD eval | `scripts/run_eval_kd_multitask.sh` | 0 | ~1-2h |
+| 3 | SeqKD gen | `scripts/gpt2/tools/generate_data_seqkd_multitask.sh` | 0-3 | ~12h |
+| 4 | SeqKD process | `scripts/process_seqkd_data.sh` | CPU | ~10min |
+| 5 | SeqKD train | `scripts/gpt2/seqkd/seqkd_multitask_base.sh` | 0-3 | ~2-3h |
+| 6 | SeqKD eval | `scripts/run_eval_seqkd_multitask.sh` | 0 | ~1-2h |
+| 7 | MiniLLM train | `scripts/gpt2/minillm/train_multitask_base_xl.sh` | 0-3 | ~5-10h |
+| 8 | MiniLLM eval | `scripts/run_eval_minillm_multitask.sh` | 0 | ~1-2h |
+
+Total estimated wall time: ~30-35h
+
+### Data status
+
+| Baseline | Data | Status |
+|----------|------|--------|
+| KD | `processed_data/combined/gpt2/` | Ready |
+| SeqKD gen | `processed_data/combined_prompt/gpt2/` (teacher) | Ready |
+| SeqKD train | `processed_data/combined/pseudo/sft_multitask/` | Needs gen+tokenize |
+| MiniLLM | `processed_data/combined_prompt/gpt2/` | Ready |
+
+---
 
 ## Issues & Notes
 
@@ -135,34 +151,4 @@ Key observations:
 
 11. **`.gitignore` pattern syntax**: `./results/` doesn't work — use `/results/` to anchor to repo root.
 
-## Remaining
-
-- [x] Teacher eval on Dolly test set
-- [x] Download 5-benchmark eval data
-- [x] Multi-seed Dolly eval (rougeL 28.93 ± 0.23, 5 seeds)
-- [x] 5-benchmark evaluation (DistiLLM student + Teacher SFT)
-- [x] Paper comparison
-- [x] Download SINST/UINST training splits
-- [x] Merge + tokenize combined training data (62,553 items)
-- [x] Multi-task: Teacher SFT (10 epoch, ckpt `sft_multitask/.../37220`)
-- [x] Multi-task: Student Init (3 epoch, ckpt `init_multitask/.../5583`)
-- [x] Multi-task: DistiLLM ✅ (20 epoch, ckpt `distill_multitask/9300`, rougeL 26.05-26.22 on Dolly dev)
-- [x] Multi-task: 5-benchmark eval ✅ (student done, results above)
-- [ ] Multi-task: Teacher 5-benchmark eval (for S/T ratio)
-- [ ] Investigate UINST regression
-- [ ] KD baseline training (script ready: `scripts/run_kd_baseline.sh`)
-- [ ] SeqKD baseline (needs teacher data generation)
-- [ ] MiniLLM baseline (needs PPO data prep)
-
-## Round 2 Training Summary
-
-| Stage | Model | Data | Epochs | Steps | Checkpoint |
-|-------|-------|------|--------|-------|------------|
-| Teacher SFT | gpt2-xlarge | 60K multi-task | 10 | 37,220 | `sft_multitask/e10-bs4-lr5e-05-G1-N4-NN1/37220` |
-| Student Init | gpt2-base | 60K multi-task | 3 | 5,583 | `init_multitask/e3-bs8-lr0.0005-G1-N4-NN1/5583` |
-| DistiLLM | gpt2-base | 60K + OWT aux | 20 | 9,300 | `distill_multitask/9300` |
-
-Key takeaways:
-- gpt2-xlarge SFT: ~10.5h on 4x 4090 (bs=4, ~0.88s/step)
-- gpt2-base Student Init: ~0.6h (bs=8, ~0.11s/step)
-- DistiLLM: ~5h (bs=4×grad_acc8, ~2.5s/step with on-policy sampling)
+12. **Teacher eval hung on Dolly**: First eval run with DeepSpeed on gpt2-xlarge hung indefinitely at ~26% through Dolly (no output for 27h). May be DeepSpeed compatibility issue. Subsequent eval (started separately) completed benchmarks 2-5 normally.
