@@ -193,4 +193,5 @@ pyrightconfig.json
 *.tar.gz
 /autopipe/runs/
 /autopipe/logs/
+/autopipe/queue/
 .lock_*
