@@ -191,3 +191,6 @@ pyrightconfig.json
 /checkpoints/
 /processed_data/
 *.tar.gz
+/autopipe/runs/
+/autopipe/logs/
+.lock_*

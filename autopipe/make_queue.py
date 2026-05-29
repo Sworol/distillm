@@ -115,10 +115,11 @@ def distillm_specs() -> List[Dict[str, Any]]:
     return specs
 
 
-def build_exp(spec: Dict[str, Any]) -> Dict[str, Any]:
+def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
     exp_id = f"{spec['key']}_{uuid.uuid4().hex[:8]}"
     return {
         "exp_id": exp_id,
+        "seq": seq,  # execution order
         "key": spec["key"],
         "cmd_type": "bash",
         "cmd": spec["cmd"],
@@ -145,9 +146,10 @@ def main() -> None:
     paths.queue_dir.mkdir(parents=True, exist_ok=True)
 
     specs = distillm_specs()
-    for spec in specs:
-        exp = build_exp(spec)
-        out = paths.queue_dir / f"{exp['exp_id']}.json"
+    for i, spec in enumerate(specs):
+        exp = build_exp(spec, seq=i + 1)
+        # Zero-padded numeric prefix enforces execution order in glob sort
+        out = paths.queue_dir / f"{exp['seq']:02d}_{exp['exp_id']}.json"
         atomic_write_json(out, exp)
         print(f"[{spec['key']}] {out}")
 
