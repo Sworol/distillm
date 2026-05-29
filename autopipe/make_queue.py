@@ -132,7 +132,7 @@ def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
         "train_timeout": spec.get("train_timeout", 86400),
         "skip_vis": spec.get("skip_vis", True),
         "conda_env": spec.get("conda_env", "llm_train"),
-        "hard_failure_threshold": 0,  # disable LLM agent auto-repair
+        "hard_failure_threshold": 3,  # allow LLM agent up to 3 repair attempts per error hash
     }
 
 

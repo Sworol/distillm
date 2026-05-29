@@ -116,6 +116,8 @@ def classify_failure(log_path: Path) -> str:
 
     if "cuda out of memory" in combined or ("out of memory" in combined and "cuda" in combined):
         return "oom"
+    if "loss scale" in combined and ("minimum" in combined or "cannot decrease" in combined):
+        return "loss_scale"
     if "huggingface.co" in combined and ("timeout" in combined or "timed out" in combined or "rate limit" in combined):
         return "hf"
     if "temporary failure in name resolution" in combined or "connection reset by peer" in combined:

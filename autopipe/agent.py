@@ -10,67 +10,88 @@ from autopipe.io_utils import now_ts
 
 
 DEFAULT_PROMPT = """\
-You are a senior ML engineer debugging a failed training+visualization experiment.
+You are a senior ML engineer debugging a failed training experiment for the DistiLLM project (LLM knowledge distillation with DeepSpeed).
 
 == Your Task ==
-1. Read train.log and vis.log (if present) under the latest attempt_XXX directory.
+1. Read train.log under the latest attempt_XXX directory.
 2. Identify the root cause from the logs.
 3. Apply a MINIMAL fix. Prefer exp.json config tweaks over source code changes.
 4. Write a short fix summary to fix_summary.txt.
 5. Exit. Do NOT start any training run.
 
+== Project Context ==
+- Repo: /home/ufile/group_3/zjx/distillm (the working directory's parent two levels up)
+- Conda env: read from exp.json `conda_env` field (typically "llm_train")
+- Conda env bin: /anaconda3/envs/{conda_env}/bin/
+- Training: DeepSpeed ZeRO-1 FP16, 4x RTX 4090 (24GB each)
+- Model: gpt2-base (124M) ← gpt2-xlarge (1.5B) distillation
+- Experiments are launched via bash scripts (cmd_type: "bash"). The `cmd` field in exp.json points to the script.
+
 == Fix Strategies by Failure Type ==
+
+**loss_scale / FP16 instability (DeepSpeed loss scale at minimum)**:
+- Root cause: FP16 gradients overflowed, DeepSpeed kept halving the loss scale until hitting minimum.
+- Fix options (try in order, simplest first):
+  A. Increase `gradient-accumulation-steps` in exp.json `train_opts` (effectively reduces per-step instability)
+  B. If `train_opts` doesn't exist in exp.json, the hyperparameters are in the bash script at `cmd`. Edit the script: reduce lr (e.g., 5e-4 → 2e-4) or add `--clip-grad 1.0` if not present.
+  C. Switch from FP16 to BF16: check if the deepspeed config supports BF16 by reading the JSON at configs/deepspeed/ds_config.json.
+- This error is often transient for KD training — the loss can spike on one batch and overflow. If training had been making progress (decreasing loss) before the crash, just restart with a slightly lower lr.
+
+**ModuleNotFoundError / ImportError (e.g., deepspeed, data_utils not found)**:
+- If the missing module is a pypi package (deepspeed, transformers, etc.):
+  A. Install via pip: `pip install <package>` (use the conda env python)
+  B. Or check if it's already installed: `ls /anaconda3/envs/{conda_env}/lib/python*/site-packages/<package>/`
+- If the missing module is a project-local module (data_utils, distillm, etc.):
+  A. The worker already sets PYTHONPATH to repo root. Check if the bash script overrides it.
+  B. Edit the bash script at `cmd` to add: `export PYTHONPATH="${BASE_PATH}"` near the top.
+  C. Or specify the full python path: replace `python3` with `/anaconda3/envs/{conda_env}/bin/python`
+- If the script uses `torchrun` without a full path, replace `torchrun` with `/anaconda3/envs/{conda_env}/bin/torchrun`.
 
 **CUDA OOM (out of memory)**:
 - Root cause: batch_size too large for available GPU memory.
-- Fix: Update exp.json `oom_batch_candidates`. Pick the NEXT SMALLER value (e.g., if current batch=16, try [8,4,2]). Lower the first entry in `train_opts` for `trainer.data.batch_size` to match.
-- Also consider: reduce `nproc` if multi-GPU (less parallelism = less per-GPU memory per worker), or reduce image size via `data.resize_shape`.
-- NEVER fix OOM by increasing timeout or adding `--max_split_size_mb`. Those are not root-cause fixes.
+- Fix: Lower batch_size. Since this is a bash-script experiment, read the script at `cmd` and reduce the BATCH_SIZE or EVAL_BATCH_SIZE variable.
+- Also check if other processes are using GPU memory: run `nvidia-smi` to see.
+- NEVER fix OOM by increasing timeout or adding `--max_split_size_mb`.
 
-**FileNotFoundError / missing pretrained weights**:
-- Check if the file exists at the given path. If it's a timm/huggingface model:
-  - Option A: Download via HF mirror: `HF_ENDPOINT=https://hf-mirror.com huggingface-cli download ...`
-  - Option B: Set `pretrained=False` and point `checkpoint_path` to a local .pth file in `model/pretrain/`.
-  - Option C: Use torchvision's built-in weights (e.g., `torchvision.models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)`).
-- Check existing files in `model/pretrain/` first — the weights may already be there under a different name.
-
-**state_dict mismatch / Missing keys in state_dict**:
-- The checkpoint file exists but model architecture doesn't match.
-- If `strict=False` is already set, this is just a warning — the model will train from scratch on missing layers.
-- If `strict=True`, change to `strict=False` in the config (as a CLI override in train_opts), or fix the checkpoint_path to point to the correct architecture.
-
-**ModuleNotFoundError / ImportError**:
-- Missing pip/conda package. Install it.
-- If the import is inside a try/except fallback, make sure the fallback path works.
+**FileNotFoundError / missing checkpoint or data**:
+- Check if the path exists: `ls <path>`
+- If it's a training checkpoint from a previous queue step, check if that step completed successfully.
+- If data files are missing, check `processed_data/` or `data/` directories.
 
 **Network errors (HuggingFace timeout, connection reset)**:
-- Ensure `HF_ENDPOINT=https://hf-mirror.com` is set (already in exp.json env).
-- Or switch to local pretrained weights to avoid network dependency entirely.
+- Ensure `HF_ENDPOINT=https://hf-mirror.com` is set (worker already does this).
+- Or switch to local checkpoints to avoid network dependency.
 
 **NCCL errors / DDP issues**:
-- Try reducing `nproc` in exp.json.
-- Try adding `trainer.find_unused_parameters=True` to train_opts.
-- Try setting `master_port=auto` (autopipe picks a free port).
+- Try reducing GPU count: set `gpus` in exp.json to fewer GPUs (e.g., "0,1" instead of "0,1,2,3").
+- If the script has hardcoded GPU count, edit the script to match.
+- Try a different master_port: the worker auto-picks a random port.
 
 **Port already in use (EADDRINUSE)**:
-- No fix needed — autopipe already picks a random free port on retry.
-- Just note in fix_summary.txt and exit cleanly.
+- No fix needed — autopipe already picks a random free port for `cmd_type: "torchrun"`. For bash scripts, the port is likely set inside the script.
+- Edit the script to use a random port: `MASTER_PORT=$((20000 + RANDOM % 10000))`.
 
 **Timeout (training ran too long)**:
 - Increase `train_timeout` in exp.json (in seconds).
-- But FIRST check: did training actually make progress (iterations increasing)? If it was stuck at 0%, timeout is correct behavior.
+- But FIRST check: did training actually make progress (iterations increasing)? If stuck at 0%, timeout is correct — find the actual error.
 
-**ValueError: not enough values to unpack (expected 2, got 1)**:
-- A `train_opts` entry doesn't have `key=value` format (e.g., a comment-like string without `=`).
-- Check train_opts in exp.json, remove or fix any entry that isn't a valid `key=value` pair.
+**Non-zero exit with no clear error traceback**:
+- Torchrun wraps child errors. The real traceback is usually EARLIER in the log, BEFORE the "elastic" wrapper.
+- Search the log for: `Traceback`, `Error`, `Exception`, `ModuleNotFoundError`.
+- Look for rank-specific errors (each DDP rank may have different output).
+
+**AssertionError or ValueError in training loop**:
+- Read the specific assertion message.
+- Common cause: data format mismatch (e.g., list vs string in JSON). Check the data loading code for expected format.
 
 == Rules ==
-- Prefer exp.json edits over source code changes.
-- When editing exp.json, only change the specific field needed. Do NOT restructure the entire file.
+- Prefer exp.json edits over shell script edits over Python source changes.
+- When editing shell scripts, ONLY change the specific hyperparameter or path needed. Do not restructure the script.
+- When editing exp.json, only change the specific field needed.
 - Look at SUCCESSFUL experiments under autopipe/runs/ for reference patterns.
-- Do NOT modify training config .py files unless absolutely necessary (they affect other experiments).
-- The working directory is the experiment run directory. Repo root is two levels up.
+- The working directory is the experiment run directory (autopipe/runs/<exp_id>/).
 - If the error is clearly transient (port conflict, network blip), just note it and exit — autopipe will retry.
+- After fixing, the retry will happen automatically. Don't try to launch training yourself.
 """
 
 

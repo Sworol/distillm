@@ -369,11 +369,21 @@ def main() -> None:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = exp.get("gpus", "0,1,2,3")
         # Force hf mirror endpoint to avoid relying on user shell environment.
-        # (If you want to disable this, set HF_ENDPOINT explicitly in your process wrapper and
-        # remove this line.)
         env["HF_ENDPOINT"] = exp.get("hf_endpoint", "https://hf-mirror.com")
         env["AUTOPIPE_EXP_ID"] = str(exp.get("exp_id", ""))
         env["AUTOPIPE_ATTEMPT"] = str(attempt)
+
+        # Inject conda env bin into PATH so bash scripts find the right torchrun/python.
+        conda_env = exp.get("conda_env", "")
+        if conda_env:
+            conda_bin = f"/anaconda3/envs/{conda_env}/bin"
+            if os.path.isdir(conda_bin):
+                env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
+                # Ensure conda env python is discoverable as `python` (some scripts don't use python3).
+                if os.path.exists(f"{conda_bin}/python"):
+                    env["CONDA_PYTHON"] = f"{conda_bin}/python"
+        # Ensure repo root is on sys.path for scripts that import data_utils etc.
+        env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
 
         cmd_type = exp.get("cmd_type", "torchrun")
         nproc = int(exp.get("nproc", 4))
