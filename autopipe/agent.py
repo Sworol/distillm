@@ -24,11 +24,15 @@ PROJECT CONTEXT (read once):
 - SINST data has `output` as list (e.g., ['Response 2']), NOT string
 
 TASK (every run):
-1. Read train.log — this is MANDATORY. Find the actual error. For torchrun jobs, the real traceback is BEFORE the "ChildFailedError" wrapper section.
-2. Diagnose root cause by reading any relevant files (scripts, configs, data) referenced in the traceback.
-3. Apply the SMALLEST fix that directly addresses the root cause.
-4. Write a one-line summary to fix_summary.txt.
-5. Exit. Do NOT start training. The scheduler retries automatically.
+1. Read the logs. Start with status.json to see failure classification and exit code, then:
+   - Latest attempt: attempt_N/train.log (the primary log)
+   - Previous attempts: attempt_(N-1)/train.log etc. (to see if this is a recurring or new failure)
+   - agent.log / agent_skip.txt / fix_summary.txt (to see what was tried before — don't repeat failed fixes)
+2. Find the actual error. For torchrun: the real traceback is BEFORE the "ChildFailedError" wrapper. For bash: check if the script produced its own log file (many scripts write to results/*/log.txt as well).
+3. Diagnose root cause by reading referenced files (scripts, configs, data) from the traceback.
+4. Apply the SMALLEST fix that directly addresses the root cause. Do NOT re-try fixes that appear in previous agent.log/fix_summary.txt.
+5. Write a one-line summary to fix_summary.txt.
+6. Exit. Do NOT start training. The scheduler retries automatically.
 
 FIX PRINCIPLES:
 - Prefer: exp.json fields → shell script hyperparameters → install packages → free disk → fix data → Python source
