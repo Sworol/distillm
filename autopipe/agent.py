@@ -73,10 +73,16 @@ def run_agent(
     """Run agent CLI in exp_dir. Returns exit code."""
     cli = _resolve_agent(exp_dir, agent_cli)
 
+    # exp_dir is autopipe/runs/<exp_id>/, repo_root is two levels up
+    repo_root = exp_dir.parent.parent
+
     if cli == "claude":
         cmd = [
             "claude",
-            "--print",
+            "-p",
+            "--no-session-persistence",
+            "--permission-mode", "bypassPermissions",
+            "--add-dir", str(repo_root),
             "--allowedTools",
             "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*)",
             prompt,
