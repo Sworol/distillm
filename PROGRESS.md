@@ -81,21 +81,26 @@
 
 **Multi-seed Dolly (5 seeds):** 28.93 ± 0.23 rougeL
 
-### Comparison with Paper
+### Round 2 Results: Multi-task DistiLLM vs Paper
 
-Paper uses multi-task instruction teacher; our teacher is Dolly-only → absolute numbers lower on SINST/UINST (~4 points). But S/T retention is 80-104%.
+| Benchmark | Round 2 | Round 1 | Paper DistiLLM | vs Paper |
+|-----------|---------|---------|----------------|----------|
+| Dolly | **26.67** | 26.64 | 26.11 ± 0.68 | +0.56 |
+| Self-Inst | **13.51** | 12.05 | 13.14 ± 0.69 | +0.37 |
+| Vicuna | 16.12 | 16.90 | 18.46 ± 0.53 | -2.34 |
+| SINST | **35.71** | 23.44 | 27.51 ± 0.03 | **+8.20** |
+| UINST | 21.93 | 25.70 | 29.35 ± 0.07 | -7.42 |
 
-| Benchmark | Our DistiLLM | Paper DistiLLM | Paper KD |
-|-----------|-------------|----------------|----------|
-| Dolly | 26.64 (held-out) | 26.11 ± 0.68 | 23.52 |
-| Self-Inst | 12.05 | 13.14 ± 0.69 | 11.23 |
-| Vicuna | 16.90 | 18.46 ± 0.53 | 15.92 |
-| SINST | 23.44 | 27.51 ± 0.03 | 20.68 |
-| UINST | 25.70 | 29.35 ± 0.07 | 23.38 |
+Key observations:
+- SINST +12.27 vs Round 1 — multi-task training highly effective (trained on SINST 0_2/3_6/6_10)
+- Self-Inst slightly improved, exceeds paper
+- Vicuna slightly lower (no training data for Vicuna)
+- UINST regressed (-3.77 vs Round 1, -7.42 vs paper) — needs investigation
+- Teacher eval needed for S/T ratio analysis
 
-## Pipeline — Round 2: Multi-task training (in progress)
+## Pipeline — Round 2: Multi-task training ✅
 
-### Combined training data ✅
+### Combined training data
 
 | Source | Items | Role |
 |--------|-------|------|
@@ -104,14 +109,7 @@ Paper uses multi-task instruction teacher; our teacher is Dolly-only → absolut
 | SINST 0_2 + 3_6 + 6_10 | 6,660 | Training |
 | UINST 0_2 + 3_5 + 6_10 | 40,893 | Training |
 | **Total train** | **59,553** | |
-| **Total** | **62,553** | ← `processed_data/combined/gpt2/` |
-
-### Multi-task training script
-
-Script: `run_multitask_experiment.sh`
-- Stage 1: Teacher SFT — 10 epochs, ~74K steps (estimated ~2 days on 4x 4090)
-- Stage 2: Student Init — 3 epochs
-- Stage 3: DistiLLM — 20 epochs, adaptive-sfkl + replay buffer + OWT auxiliary
+| **Total** | **62,553** | ← `processed_data/combined/gpt2/`
 
 ## Issues & Notes
 
@@ -149,8 +147,9 @@ Script: `run_multitask_experiment.sh`
 - [x] Multi-task: Teacher SFT (10 epoch, ckpt `sft_multitask/.../37220`)
 - [x] Multi-task: Student Init (3 epoch, ckpt `init_multitask/.../5583`)
 - [x] Multi-task: DistiLLM ✅ (20 epoch, ckpt `distill_multitask/9300`, rougeL 26.05-26.22 on Dolly dev)
-- [/] Multi-task: 5-benchmark eval — **running** (student eval: `logs/eval_multitask_student.log`; teacher pending)
-- [ ] Multi-task: Teacher 5-benchmark eval (for S/T ratio calculation)
+- [x] Multi-task: 5-benchmark eval ✅ (student done, results above)
+- [ ] Multi-task: Teacher 5-benchmark eval (for S/T ratio)
+- [ ] Investigate UINST regression
 - [ ] KD baseline training (script ready: `scripts/run_kd_baseline.sh`)
 - [ ] SeqKD baseline (needs teacher data generation)
 - [ ] MiniLLM baseline (needs PPO data prep)
