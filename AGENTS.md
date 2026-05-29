@@ -1,12 +1,18 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `distillm/`: core distillation implementation (training loops, utilities used by scripts).
-- `minillm/`: upstream baseline components this repo builds on (MiniLLM-style training/distillation).
-- `autopipe/`: lightweight experiment orchestration (queue-based scheduler + worker for batch-running baselines).
+- `distillm/`: core distillation implementation (losses, sampler, buffer, training loops).
+- `minillm/`: upstream PPO-based baseline components (MiniLLM-style training/distillation).
+- `autopipe/`: self-healing experiment orchestration with LLM agent auto-repair.
+  - `make_queue.py`: generates queue entries in `autopipe/queue/` with numeric prefixes for ordering.
+  - `scheduler.py`: polls queue, spawns workers (max 1 parallel), handles exponential backoff, stale worker recovery, aborted-task hotfix detection.
+  - `worker.py`: runs bash scripts under conda env, classifies failures (15 error patterns), auto-reduces batch_size on OOM, invokes agent for non-OOM failures.
+  - `agent.py`: invokes `claude` CLI with `--add-dir <repo_root> --permission-mode bypassPermissions` for LLM-powered log diagnosis and code repair.
+  - `io_utils.py`: atomic JSON writes, lock files, failure classification from train.log.
+  - `config.py`: path resolution for queue/runs/logs directories.
 - `data_utils/` and `tools/`: dataset prep, tokenization, and helper scripts (e.g., OpenWebText utilities).
 - `scripts/`: runnable experiment entrypoints grouped by model family (`gpt2/`, `opt/`, `openllama2/`) and task (`sft/`, `kd/`, `distillm/`, `eval/`, `tools/`).
-- `configs/`: configuration files used by training/eval.
+- `configs/`: configuration files used by training/eval (DeepSpeed ZeRO-1 configs).
 - Top-level entrypoints: `finetune.py`, `generate.py`, `evaluate.py`, `evaluate_main.py`, `train_minillm.py`.
 
 ## Build, Test, and Development Commands

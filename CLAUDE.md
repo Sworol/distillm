@@ -62,13 +62,34 @@ All training/eval is launched via shell scripts organized as `scripts/{model_fam
 
 ## autopipe — Experiment Orchestration
 
-The `autopipe/` module (adapted from Ader project) provides a lightweight queue-based pipeline runner. It manages long-running experiments without manual intervention.
+The `autopipe/` module provides a self-healing queue-based pipeline runner with LLM agent auto-repair. It manages long-running experiments without manual intervention.
+
+### Architecture
+
+```
+make_queue.py          →  generates queue entries in autopipe/queue/ (numeric prefixed for ordering)
+scheduler.py           →  polls queue, spawns workers (max 1 parallel for single-node multi-GPU)
+worker.py              →  runs bash scripts under conda env, records outcome, classifies failures
+  ├─ classify_failure  →  15 error patterns (oom, loss_scale, nan, disk_full, hf, net, import,
+  │                       port, nccl, path, data, shape, assert, killed, ckpt)
+  ├─ OOM auto-reduce   →  halve batch_size, cap at batch_size=1
+  └─ agent.py          →  invoke claude CLI for LLM-powered diagnosis and repair
+```
 
 ### How it works
-1. `make_queue.py` → generates JSON queue entries in `autopipe/queue/`
-2. `scheduler.py` → polls queue, picks `pending` items, spawns workers
-3. `worker.py` → runs a single experiment (bash script or torchrun), records success/failed
+1. `make_queue.py` → generates JSON queue entries in `autopipe/queue/` (numbered `01_`-`08_` for ordering)
+2. `scheduler.py` → polls queue, picks `pending` items, spawns workers via `subprocess.Popen`
+3. `worker.py` → injects conda bin to PATH, sets PYTHONPATH, runs bash script, records success/failed
 4. On failure: exponential backoff retry, OOM batch-size auto-reduction, optional LLM agent repair
+5. Agent (`agent.py`): invokes `claude` CLI with `--add-dir <repo_root> --permission-mode bypassPermissions`, agent reads logs → diagnoses root cause → applies fix → writes `fix_summary.txt` → exits
+6. `hard_failure_threshold=3` limits agent repair attempts per unique error hash (prevents infinite repair loops)
+7. Aborted tasks only auto-retry if queue config `mtime > run config mtime` (hotfix detection)
+
+### Agent prompt strategy
+- Principle-based, not exhaustive: agent reads logs itself rather than matching against a pre-enumerated error catalog
+- Full repo access: `--add-dir` grants access to scripts, configs, data outside the run directory
+- Fix precedence: exp.json fields → shell script hyperparameters → install packages → free disk → fix data → Python source
+- Surgical edits only (no restructuring). Agent writes one-line summary, does NOT restart training.
 
 ### Usage
 ```bash
@@ -85,6 +106,7 @@ python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-parallel 1
 {
   "exp_id": "kd_train_xxx",
   "key": "kd_train",
+  "seq": 1,
   "cmd_type": "bash",
   "cmd": "/path/to/script.sh",
   "conda_env": "llm_train",
@@ -92,14 +114,18 @@ python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-parallel 1
   "train_timeout": 86400,
   "skip_vis": true,
   "max_retries": 1,
-  "retry_sleep": 60
+  "retry_sleep": 60,
+  "hard_failure_threshold": 3
 }
 ```
 
 ### Artifacts
-- Queue: `autopipe/queue/<exp_id>.json`
-- Run artifacts: `autopipe/runs/<exp_id>/attempt_XXX/` (train.log, exp.json, status.json)
+- Queue: `autopipe/queue/<seq>_<exp_id>.json`
+- Run artifacts: `autopipe/runs/<exp_id>/attempt_N/` (train.log, status.json)
+- Per-run: `exp.json`, `status.json`, `agent.log`, `fix_summary.txt`, `agent_skip.txt`
+- Agent diffs: `git_diff_pre_agent_*.patch`, `git_diff_post_agent_*.patch`
 - Scheduler log: `autopipe/logs/scheduler_<exp_id>.log`
+- Locks: `.lock_scheduler` (scheduler singleton), `.lock_worker` (per-experiment worker singleton)
 
 ## Key dependencies
 - conda env `llm_train` with PyTorch 2.4.0, CUDA 12.4

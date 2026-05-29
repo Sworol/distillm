@@ -97,22 +97,50 @@
 
 ## Baseline Experiments (Autopipe Orchestration)
 
-Experiments are managed via `autopipe/` scheduler. Queue in `autopipe/queue/`, run artifacts in `autopipe/runs/`.
+Experiments are managed via `autopipe/` — a self-healing queue-based pipeline runner with LLM agent auto-repair.
 
 Start: `python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-parallel 1`
 
+### Architecture
+
+```
+make_queue.py          →  autopipe/queue/*.json (8 experiments, ordered by numeric prefix)
+scheduler.py           →  polls queue, picks pending items, spawns workers (max 1 parallel)
+worker.py              →  runs bash script under conda env, records success/failure
+  ├─ classify_failure  →  scans train.log for 15 error patterns (oom, loss_scale, nan, ...)
+  ├─ OOM auto-reduce   →  halve batch size, cap at 1
+  └─ agent.py          →  on unclassified/OOM-exhausted failures: invoke claude CLI for diagnosis+repair
+```
+
+### Agent Auto-Repair (`autopipe/agent.py`)
+
+On worker-detected failure that can't be handled by OOM-reduction:
+1. Worker calls `classify_failure()` on train.log → maps to error type (oom, loss_scale, nan, import, port, etc.)
+2. If error is new (by error_hash dedup), invokes `claude` CLI with `--add-dir` pointing to repo root
+3. Agent reads all logs (train.log, previous attempts, agent.log, fix_summary.txt), diagnoses root cause, applies smallest fix, writes one-line summary, exits
+4. Scheduler retries with exponential backoff (up to `hard_failure_threshold=3` per error hash)
+5. Agent has access to: Read/Write/Edit + Bash (ls, find, cat, grep, pip, python, df, nvidia-smi)
+
+Key agent CLI flags: `-p --no-session-persistence --permission-mode bypassPermissions --add-dir <repo_root>`
+
+### Worker Environment Setup
+
+Before running bash scripts, worker injects:
+- `PATH`: prepends `/anaconda3/envs/{conda_env}/bin/` (ensures correct torchrun, python)
+- `PYTHONPATH`: set to repo root (ensures `data_utils`, `distillm` imports work)
+
 ### Queue (sequential execution)
 
-| # | Task | Script | GPUs | Est. Time |
-|---|------|--------|------|-----------|
-| 1 | KD train | `scripts/run_kd_multitask.sh` | 0-3 | ~2-3h |
-| 2 | KD eval | `scripts/run_eval_kd_multitask.sh` | 0 | ~1-2h |
-| 3 | SeqKD gen | `scripts/gpt2/tools/generate_data_seqkd_multitask.sh` | 0-3 | ~12h |
-| 4 | SeqKD process | `scripts/process_seqkd_data.sh` | CPU | ~10min |
-| 5 | SeqKD train | `scripts/gpt2/seqkd/seqkd_multitask_base.sh` | 0-3 | ~2-3h |
-| 6 | SeqKD eval | `scripts/run_eval_seqkd_multitask.sh` | 0 | ~1-2h |
-| 7 | MiniLLM train | `scripts/gpt2/minillm/train_multitask_base_xl.sh` | 0-3 | ~5-10h |
-| 8 | MiniLLM eval | `scripts/run_eval_minillm_multitask.sh` | 0 | ~1-2h |
+| # | Task | Script | GPUs | Est. Time | Status |
+|---|------|--------|------|-----------|--------|
+| 1 | KD train | `scripts/run_kd_multitask.sh` | 0-3 | ~2-3h | running (attempt 2) |
+| 2 | KD eval | `scripts/run_eval_kd_multitask.sh` | 0 | ~1-2h | pending |
+| 3 | SeqKD gen | `scripts/gpt2/tools/generate_data_seqkd_multitask.sh` | 0-3 | ~12h | pending |
+| 4 | SeqKD process | `scripts/process_seqkd_data.sh` | CPU | ~10min | pending |
+| 5 | SeqKD train | `scripts/gpt2/seqkd/seqkd_multitask_base.sh` | 0-3 | ~2-3h | pending |
+| 6 | SeqKD eval | `scripts/run_eval_seqkd_multitask.sh` | 0 | ~1-2h | pending |
+| 7 | MiniLLM train | `scripts/gpt2/minillm/train_multitask_base_xl.sh` | 0-3 | ~5-10h | pending |
+| 8 | MiniLLM eval | `scripts/run_eval_minillm_multitask.sh` | 0 | ~1-2h | pending |
 
 Total estimated wall time: ~30-35h
 
@@ -124,6 +152,16 @@ Total estimated wall time: ~30-35h
 | SeqKD gen | `processed_data/combined_prompt/gpt2/` (teacher) | Ready |
 | SeqKD train | `processed_data/combined/pseudo/sft_multitask/` | Needs gen+tokenize |
 | MiniLLM | `processed_data/combined_prompt/gpt2/` | Ready |
+
+### Autopipe Bug Fixes & Improvements
+
+1. **Queue ordering**: Renamed queue files with `01_`-`08_` numeric prefixes. `make_queue.py` now generates prefixed names via `seq` parameter.
+2. **Infinite retry loop**: `max_retries=1` + automatic `aborted→failed` reset caused 26 restarts. Fixed: aborted tasks only auto-retry if queue config mtime > run config mtime.
+3. **Agent CLI args**: Fixed from `--print` (wrong) to `-p --no-session-persistence --permission-mode bypassPermissions --add-dir <repo_root>`.
+4. **hard_failure_threshold merge**: Added to scheduler's `merge_keys` so queue updates propagate to run configs.
+5. **Conda env injection**: Worker now prepends conda bin to PATH and sets PYTHONPATH before running bash scripts (fixes bare `torchrun` resolving to wrong env).
+6. **Failure classification**: Expanded from 7 to 15 error patterns (added loss_scale, nan, disk_full, data, shape, assert, killed, ckpt).
+7. **Agent prompt**: Rewrote from exhaustive 100+ line error catalog to principle-based methodology — agent reads logs itself and diagnoses ANY failure.
 
 ---
 
