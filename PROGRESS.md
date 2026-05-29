@@ -148,8 +148,22 @@ Script: `run_multitask_experiment.sh`
 - [x] Merge + tokenize combined training data (62,553 items)
 - [x] Multi-task: Teacher SFT (10 epoch, ckpt `sft_multitask/.../37220`)
 - [x] Multi-task: Student Init (3 epoch, ckpt `init_multitask/.../5583`)
-- [/] Multi-task: DistiLLM — **running** (20 epoch, adaptive-sfkl, log: `logs/stage3_distillm.log`)
-- [ ] Multi-task: 5-benchmark re-evaluation
+- [x] Multi-task: DistiLLM ✅ (20 epoch, ckpt `distill_multitask/9300`, rougeL 26.05-26.22 on Dolly dev)
+- [/] Multi-task: 5-benchmark eval — **running** (student eval: `logs/eval_multitask_student.log`; teacher pending)
+- [ ] Multi-task: Teacher 5-benchmark eval (for S/T ratio calculation)
 - [ ] KD baseline training (script ready: `scripts/run_kd_baseline.sh`)
 - [ ] SeqKD baseline (needs teacher data generation)
 - [ ] MiniLLM baseline (needs PPO data prep)
+
+## Round 2 Training Summary
+
+| Stage | Model | Data | Epochs | Steps | Checkpoint |
+|-------|-------|------|--------|-------|------------|
+| Teacher SFT | gpt2-xlarge | 60K multi-task | 10 | 37,220 | `sft_multitask/e10-bs4-lr5e-05-G1-N4-NN1/37220` |
+| Student Init | gpt2-base | 60K multi-task | 3 | 5,583 | `init_multitask/e3-bs8-lr0.0005-G1-N4-NN1/5583` |
+| DistiLLM | gpt2-base | 60K + OWT aux | 20 | 9,300 | `distill_multitask/9300` |
+
+Key takeaways:
+- gpt2-xlarge SFT: ~10.5h on 4x 4090 (bs=4, ~0.88s/step)
+- gpt2-base Student Init: ~0.6h (bs=8, ~0.11s/step)
+- DistiLLM: ~5h (bs=4×grad_acc8, ~2.5s/step with on-policy sampling)
