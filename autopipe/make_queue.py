@@ -12,7 +12,7 @@ from autopipe.io_utils import atomic_write_json, now_ts
 def distillm_specs() -> List[Dict[str, Any]]:
     """Defines all DistiLLM baseline experiments in execution order."""
 
-    BASE = "/home/ufile/group_3/zjx/distillm"
+    BASE = str(Path(__file__).resolve().parent.parent)
     specs: List[Dict[str, Any]] = []
 
     # ============================================================

@@ -82,7 +82,116 @@ def _load_run_exp(queue_exp: Dict[str, Any], run_exp_path: Path) -> Dict[str, An
     return dict(queue_exp)
 
 
-def main() -> None:
+def _recover_stale_worker(
+    run_exp_path: Path,
+    queue_exp: Dict[str, Any],
+    lock_path: Path,
+    status_path: Path,
+) -> bool:
+    """Check worker health and recover if stale.
+
+    Returns True if the worker was recovered (status updated to failed),
+    False if it appears healthy and should be counted as running.
+    """
+    # Case 1: status.json exists with a terminal status — sync exp.json + clean lock.
+    try:
+        st = read_json(status_path)
+        st_status = st.get("status")
+        if st_status in {"failed", "success", "hard_failure"}:
+            patch_exp(
+                run_exp_path,
+                base=queue_exp,
+                status=st_status,
+                attempt=st.get("attempt", 0),
+                updated_at=now_ts(),
+                last_exit_code=st.get("exit_code"),
+                last_reason=st.get("reason"),
+            )
+            if lock_path.exists():
+                pid = _read_lock_pid(lock_path)
+                if pid is None or not _pid_alive(pid):
+                    try:
+                        lock_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            return True
+        # Case 2: status.json says "running" but worker lock is missing → stale.
+        if st_status == "running" and not lock_path.exists():
+            patch_exp(
+                run_exp_path,
+                base=queue_exp,
+                status="failed",
+                updated_at=now_ts(),
+                last_reason="stale_worker",
+            )
+            atomic_write_json(
+                status_path,
+                {
+                    "status": "failed",
+                    "updated_at": now_ts(),
+                    "attempt": st.get("attempt", 0),
+                    "exit_code": 1,
+                    "reason": "stale_worker",
+                },
+            )
+            return True
+    except FileNotFoundError:
+        pass
+
+    # Case 3: No status.json (or could not be read) and no lock after grace period.
+    if not lock_path.exists():
+        try:
+            age = time.time() - status_path.stat().st_mtime
+        except FileNotFoundError:
+            age = 0
+        if age > 120:
+            patch_exp(
+                run_exp_path,
+                base=queue_exp,
+                status="failed",
+                updated_at=now_ts(),
+                last_reason="stale_worker",
+            )
+            atomic_write_json(
+                status_path,
+                {
+                    "status": "failed",
+                    "updated_at": now_ts(),
+                    "attempt": 0,
+                    "exit_code": 1,
+                    "reason": "stale_worker",
+                },
+            )
+            return True
+
+    # Case 4: Lock exists but recorded PID is dead → clean lock + mark stale.
+    pid = _read_lock_pid(lock_path)
+    if pid is not None and not _pid_alive(pid):
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        patch_exp(
+            run_exp_path,
+            base=queue_exp,
+            status="failed",
+            updated_at=now_ts(),
+            last_reason="stale_worker",
+        )
+        atomic_write_json(
+            status_path,
+            {
+                "status": "failed",
+                "updated_at": now_ts(),
+                "attempt": 0,
+                "exit_code": 1,
+                "reason": "stale_worker",
+            },
+        )
+        return True
+
+    # Worker appears healthy.
+    return False
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--poll-seconds", type=int, default=30)
@@ -147,107 +256,8 @@ def main() -> None:
                     continue
 
                 status_path = run_root / "status.json"
-                lock_path = run_root / ".lock_worker"
-                try:
-                    st = read_json(status_path)
-                    st_status = st.get("status")
-                    if st_status in {"failed", "success", "hard_failure"}:
-                        patch_exp(
-                            run_exp_path,
-                            base=queue_exp,
-                            status=st_status,
-                            attempt=st.get("attempt", exp.get("attempt", 0)),
-                            updated_at=now_ts(),
-                            last_exit_code=st.get("exit_code", exp.get("last_exit_code")),
-                            last_reason=st.get("reason", exp.get("last_reason")),
-                        )
-                        # Clean up stale worker lock if the worker crashed/was killed
-                        # without releasing it (e.g. SIGKILL bypasses finally block).
-                        if lock_path.exists():
-                            pid = _read_lock_pid(lock_path)
-                            if pid is None or not _pid_alive(pid):
-                                try:
-                                    lock_path.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
-                        continue
-                    if st_status == "running":
-                        # A previous attempt may have finished but left `exp.json` stuck at
-                        # "running". If the worker lock is missing, treat it as stale.
-                        if not lock_path.exists():
-                            patch_exp(
-                                run_exp_path,
-                                base=queue_exp,
-                                status="failed",
-                                updated_at=now_ts(),
-                                last_reason="stale_worker",
-                            )
-                            atomic_write_json(
-                                status_path,
-                                {
-                                    "status": "failed",
-                                    "updated_at": now_ts(),
-                                    "attempt": exp.get("attempt", 0),
-                                    "exit_code": 1,
-                                    "reason": "stale_worker",
-                                },
-                            )
-                            continue
-                except FileNotFoundError:
-                    # fall through to stale worker check
-                    pass
-
-                # If the worker lock is missing, treat this as a stale run after a short grace period.
-                # This prevents the scheduler from getting stuck in "running" forever when a worker
-                # crashed or was killed and did not clean up bookkeeping.
-                if not lock_path.exists():
-                    try:
-                        age = time.time() - status_path.stat().st_mtime
-                    except FileNotFoundError:
-                        age = 0
-                    if age > 120:
-                        patch_exp(
-                            run_exp_path,
-                            base=queue_exp,
-                            status="failed",
-                            updated_at=now_ts(),
-                            last_reason="stale_worker",
-                        )
-                        atomic_write_json(
-                            status_path,
-                            {
-                                "status": "failed",
-                                "updated_at": now_ts(),
-                                "attempt": exp.get("attempt", 0),
-                                "exit_code": 1,
-                                "reason": "stale_worker",
-                            },
-                        )
-                        continue
-
-                pid = _read_lock_pid(lock_path)
-                if pid is not None and not _pid_alive(pid):
-                    try:
-                        lock_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    patch_exp(
-                        run_exp_path,
-                        base=queue_exp,
-                        status="failed",
-                        updated_at=now_ts(),
-                        last_reason="stale_worker",
-                    )
-                    atomic_write_json(
-                        status_path,
-                        {
-                            "status": "failed",
-                            "updated_at": now_ts(),
-                            "attempt": exp.get("attempt", 0),
-                            "exit_code": 1,
-                            "reason": "stale_worker",
-                        },
-                    )
+                worker_lock_path = run_root / ".lock_worker"
+                if _recover_stale_worker(run_exp_path, queue_exp, worker_lock_path, status_path):
                     continue
 
                 running += 1

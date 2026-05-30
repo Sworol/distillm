@@ -16,10 +16,10 @@ from typing import Any, Dict, List, Optional
 from autopipe.config import default_paths
 from autopipe.io_utils import (
     Lock,
+    _scan_log_chunk,
     atomic_write_json,
     classify_failure,
     now_ts,
-    parse_int_list,
     read_json,
 )
 from autopipe.agent import run_agent
@@ -295,15 +295,36 @@ def _read_autopipe_ckpt_path(run_dir: Path) -> Path | None:
 
 
 def _last_error_hash(train_log: Path, vis_log: Path | None = None) -> str:
-    """Extract error fingerprint from train.log and vis.log for agent dedup."""
+    """Extract error fingerprint from tail+mid chunks for agent dedup.
+
+    Avoids full-file scan (expensive for large logs) and filters torchrun
+    boilerplate lines that don't carry error signal.
+    """
     try:
-        lines = []
+        lines: list[str] = []
         for log_path in [train_log, vis_log]:
             if log_path is None or not log_path.exists():
                 continue
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
+            try:
+                file_size = log_path.stat().st_size
+            except OSError:
+                continue
+            if file_size == 0:
+                continue
+            # Scan tail 256 KB + mid 256 KB (same strategy as classify_failure).
+            chunks: list[str] = []
+            tail_size = min(256 * 1024, file_size)
+            chunks.append(_scan_log_chunk(log_path, file_size - tail_size, tail_size))
+            if file_size > 512 * 1024:
+                mid_start = int(file_size * 0.65)
+                mid_size = min(256 * 1024, file_size - mid_start)
+                chunks.append(_scan_log_chunk(log_path, mid_start, mid_size))
+            for chunk in chunks:
+                for line in chunk.splitlines():
                     lower = line.lower()
+                    # Skip torchrun boilerplate that always contains "error".
+                    if "error_file" in lower or "childfailederror" in lower:
+                        continue
                     if "error" in lower or "traceback" in lower or "exitcode" in lower:
                         lines.append(line.strip())
         return hashlib.md5("\n".join(lines[-5:]).encode()).hexdigest() if lines else ""
@@ -376,7 +397,14 @@ def main() -> None:
         # Inject conda env bin into PATH so bash scripts find the right torchrun/python.
         conda_env = exp.get("conda_env", "")
         if conda_env:
-            conda_bin = f"/anaconda3/envs/{conda_env}/bin"
+            conda_exe = shutil.which("conda")
+            if conda_exe:
+                # Infer envs root from the conda executable location.
+                # Typical layout: /path/to/conda/bin/conda -> envs dir is ../envs
+                conda_root = Path(conda_exe).resolve().parent.parent
+                conda_bin = str(conda_root / "envs" / conda_env / "bin")
+            else:
+                conda_bin = f"/anaconda3/envs/{conda_env}/bin"
             if os.path.isdir(conda_bin):
                 env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
                 # Ensure conda env python is discoverable as `python` (some scripts don't use python3).
@@ -411,7 +439,7 @@ def main() -> None:
                 exp["cfg_path"],
                 "-m",
                 "train",
-            ] + list(exp.get("train_opts", []))
+            ] + [f"{k}={v}" for k, v in exp.get("train_opts", {}).items()]
 
         train_log = attempt_dir / "train.log"
         try:
@@ -447,8 +475,9 @@ def main() -> None:
             rc = 130
 
         # If training succeeded, run visualization using that run's net.pth.
-        vis_log = attempt_dir / "vis.log"
+        vis_log = None
         if rc == 0 and not exp.get("skip_vis", False) and cmd_type != "bash":
+            vis_log = attempt_dir / "vis.log"
             run_dir, ckpt = choose_vis_checkpoint(
                 repo_root=repo_root,
                 trainer=exp["trainer"],
@@ -572,7 +601,7 @@ def main() -> None:
         # Agent is sandboxed to workspace-write for this experiment directory and should
         # only adjust exp.json for the next attempt.
         if attempt <= int(exp.get("max_retries", 2)):
-            error_hash = _last_error_hash(train_log, vis_log if vis_log.exists() else None)
+            error_hash = _last_error_hash(train_log, vis_log if vis_log is not None and vis_log.exists() else None)
 
             # Track how many times the agent has attempted to fix each error hash.
             # If the same hash persists after agent fixes, we bail out to avoid
