@@ -17,17 +17,44 @@ from typing import Any, Dict, List, Optional
 from autopipe.config import default_paths
 from autopipe.io_utils import (
     Lock,
-    _scan_log_chunk,
     atomic_write_json,
     classify_failure,
     now_ts,
     read_json,
+    scan_log_chunk,
 )
 from autopipe.agent import run_agent
 from autopipe.guard import snapshot_git
 
+# Module-level reference to the currently-running subprocess, so the SIGTERM
+# handler can kill the training process group before the worker exits.
+# If we don't do this, the scheduler's _kill_workers sends SIGTERM to the
+# conda process group, but the training subprocess (start_new_session=True)
+# is in a separate session and becomes an orphan that holds GPU memory.
+_current_subprocess: subprocess.Popen | None = None
+
+
+def _sigterm_handler(signum: int, frame: Any) -> None:
+    proc = _current_subprocess
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+    # Restore default handler and re-send so the process terminates normally.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
 
 def run_cmd(cmd: List[str], log_path: Path, env: Dict[str, str]) -> int:
+    global _current_subprocess
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab", buffering=0) as f:
         f.write(f"\n==== {now_ts()} COMMAND: {' '.join(cmd)}\n".encode())
@@ -40,6 +67,7 @@ def run_cmd(cmd: List[str], log_path: Path, env: Dict[str, str]) -> int:
             env=env,
             start_new_session=True,
         )
+        _current_subprocess = proc
         try:
             return proc.wait()
         except KeyboardInterrupt:
@@ -56,14 +84,12 @@ def run_cmd(cmd: List[str], log_path: Path, env: Dict[str, str]) -> int:
                 except Exception:
                     pass
                 return 130
+        finally:
+            _current_subprocess = None
 
 
 def run_cmd_with_timeout(cmd: List[str], log_path: Path, env: Dict[str, str], timeout_seconds: int) -> int:
-    """
-    Run a command with an overall wall-clock timeout.
-
-    Returns 124 on timeout (like GNU timeout), otherwise the subprocess return code.
-    """
+    global _current_subprocess
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab", buffering=0) as f:
         f.write(f"\n==== {now_ts()} COMMAND: {' '.join(cmd)}\n".encode())
@@ -75,6 +101,7 @@ def run_cmd_with_timeout(cmd: List[str], log_path: Path, env: Dict[str, str], ti
             env=env,
             start_new_session=True,
         )
+        _current_subprocess = proc
         try:
             return proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -91,6 +118,8 @@ def run_cmd_with_timeout(cmd: List[str], log_path: Path, env: Dict[str, str], ti
                 except Exception:
                     pass
                 return 124
+        finally:
+            _current_subprocess = None
 
 
 def run_cmd_maybe_timeout(
@@ -317,11 +346,11 @@ def _last_error_hash(train_log: Path, vis_log: Path | None = None) -> str:
             # Scan tail 256 KB + mid 256 KB (same strategy as classify_failure).
             chunks: list[str] = []
             tail_size = min(256 * 1024, file_size)
-            chunks.append(_scan_log_chunk(log_path, file_size - tail_size, tail_size))
+            chunks.append(scan_log_chunk(log_path, file_size - tail_size, tail_size))
             if file_size > 512 * 1024:
                 mid_start = int(file_size * 0.65)
                 mid_size = min(256 * 1024, file_size - mid_start)
-                chunks.append(_scan_log_chunk(log_path, mid_start, mid_size))
+                chunks.append(scan_log_chunk(log_path, mid_start, mid_size))
             for chunk in chunks:
                 for line in chunk.splitlines():
                     lower = line.lower()
@@ -330,7 +359,10 @@ def _last_error_hash(train_log: Path, vis_log: Path | None = None) -> str:
                         continue
                     if "error" in lower or "traceback" in lower or "exitcode" in lower:
                         lines.append(line.strip())
-        return hashlib.md5("\n".join(lines[-5:]).encode()).hexdigest() if lines else ""
+        # Use last 20 error-bearing lines for a stable hash across DDP ranks
+        # (torchrun may interleave output from different ranks, so 5 lines is
+        # too few to reliably capture the root cause signature).
+        return hashlib.md5("\n".join(lines[-20:]).encode()).hexdigest() if lines else ""
     except Exception:
         return ""
 
@@ -360,6 +392,11 @@ def main() -> None:
     if not lock.acquire():
         print(f"[worker] lock busy: {run_root}", file=sys.stderr)
         sys.exit(2)
+
+    # Ensure GPU processes are killed if the worker receives SIGTERM.
+    # Without this, the training subprocess (start_new_session=True) would be
+    # orphaned when the scheduler kills the conda process group.
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     try:
         status_path = run_root / "status.json"
@@ -425,6 +462,7 @@ def main() -> None:
         nproc = int(exp.get("nproc", 4))
         master_port = resolve_master_port(exp) if cmd_type != "bash" else 0
         vis_cmd = None
+        rc_vis = None
         run_dir = None
         ckpt = None
         if cmd_type == "bash":
@@ -529,7 +567,7 @@ def main() -> None:
                         "master_port": master_port,
                     },
                 )
-                rc = run_cmd_with_timeout(
+                rc_vis = run_cmd_with_timeout(
                     vis_cmd,
                     vis_log,
                     env,
@@ -538,17 +576,20 @@ def main() -> None:
             except KeyboardInterrupt:
                 with open(vis_log, "ab", buffering=0) as f:
                     f.write(f"\n==== {now_ts()} INTERRUPTED (KeyboardInterrupt)\n".encode())
-                rc = 130
+                rc_vis = 130
 
         if rc == 0:
+            vis_failed = rc_vis is not None and rc_vis != 0
             atomic_write_json(
                 status_path,
                 {
                     "status": "success",
                     "updated_at": now_ts(),
                     "attempt": attempt,
-                    "run_dir": str(run_dir) if "run_dir" in locals() else None,
-                    "ckpt_path": str(ckpt) if "ckpt" in locals() else None,
+                    "run_dir": str(run_dir) if run_dir is not None else None,
+                    "ckpt_path": str(ckpt) if ckpt is not None else None,
+                    "vis_exit_code": rc_vis if rc_vis is not None else None,
+                    "vis_failed": vis_failed,
                 },
             )
             exp["status"] = "success"
@@ -556,7 +597,7 @@ def main() -> None:
             exp["consecutive_failures"] = 0
             exp["error_hash"] = ""
             exp["last_failed_at"] = ""
-            if "run_dir" in locals():
+            if run_dir is not None:
                 exp["last_run_dir"] = str(run_dir)
             atomic_write_json(run_exp_path, exp)
             sys.exit(0)
@@ -580,9 +621,9 @@ def main() -> None:
                 "exit_code": rc,
                 "reason": reason,
                 "train_cmd": train_cmd,
-                "vis_cmd": vis_cmd if "vis_cmd" in locals() else None,
-                "run_dir": str(run_dir) if "run_dir" in locals() else None,
-                "ckpt_path": str(ckpt) if "ckpt" in locals() else None,
+                "vis_cmd": vis_cmd if vis_cmd is not None else None,
+                "run_dir": str(run_dir) if run_dir is not None else None,
+                "ckpt_path": str(ckpt) if ckpt is not None else None,
                 "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES"),
                 "hf_endpoint": env.get("HF_ENDPOINT"),
                 "nproc": nproc,
@@ -597,15 +638,22 @@ def main() -> None:
 
         # If we hit OOM, prefer a deterministic, config-driven batch backoff over
         # an LLM "repair" attempt. This keeps retries fast and reproducible.
+        #
+        # Note: we do NOT increment `consecutive_failures` here because a deterministic
+        # batch-size reduction is not a "failure" for backoff purposes. The scheduler
+        # sees status="pending" and retries immediately (skipping the "failed" cooldown).
         if reason == "oom":
             if apply_oom_batch_backoff(exp):
+                # Don't consume an attempt for deterministic batch-size backoff.
+                # The scheduler skips exponential backoff for "pending" status,
+                # so the retry is immediate and doesn't count toward max_retries.
+                exp["attempt"] = attempt - 1
                 exp["status"] = "pending"
                 exp["updated_at"] = now_ts()
-                exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
+                exp["error_hash"] = error_hash
                 exp["last_failed_at"] = str(time.time())
                 atomic_write_json(run_exp_path, exp)
                 sys.exit(rc)
-        atomic_write_json(run_exp_path, exp)
 
         # Optional auto-repair: run agent inside the experiment run directory.
         # Agent is sandboxed to workspace-write for this experiment directory and should
@@ -661,25 +709,41 @@ def main() -> None:
                     snapshot_git(repo_root, run_root, "post_agent")
                     # Record that agent ran for this error.
                     agent_fix_hashes[error_hash] = int(agent_fix_hashes.get(error_hash, 0)) + 1
+                    # Re-read exp.json to preserve agent edits (train_opts etc.).
+                    # The final write below must include agent changes.
+                    try:
+                        exp = read_json(run_exp_path)
+                    except Exception:
+                        pass
                     exp["agent_fix_hashes"] = agent_fix_hashes
+                    # Re-apply status fields set before the agent block (lost on re-read).
+                    exp["status"] = "failed"
+                    exp["last_exit_code"] = rc
+                    exp["last_reason"] = reason
                 except Exception as exc:
                     # Agent is best-effort; keep the failure recorded and let scheduler retry.
                     with open(run_root / "agent_error.txt", "a", encoding="utf-8") as f:
                         f.write(f"{now_ts()} {repr(exc)}\n")
 
-            # Update error tracking for backoff and dedup.
-            exp["error_hash"] = error_hash
-            exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
-            exp["last_failed_at"] = str(time.time())
-            atomic_write_json(run_exp_path, exp)
+        # Update error tracking for backoff and dedup.
+        # Written once after the agent block so the scheduler never reads a partial
+        # state (no intermediate write between classification and agent completion).
+        exp["status"] = "failed"
+        exp["updated_at"] = now_ts()
+        exp["last_exit_code"] = rc
+        exp["last_reason"] = reason
+        exp["error_hash"] = error_hash
+        exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
+        exp["last_failed_at"] = str(time.time())
+        atomic_write_json(run_exp_path, exp)
 
-            # Also update status.json so next attempt can dedup.
-            try:
-                st = read_json(status_path)
-                st["error_hash"] = error_hash
-                atomic_write_json(status_path, st)
-            except Exception:
-                pass
+        # Also update status.json so next attempt can dedup.
+        try:
+            st = read_json(status_path)
+            st["error_hash"] = error_hash
+            atomic_write_json(status_path, st)
+        except Exception:
+            pass
         sys.exit(rc)
     finally:
         lock.release()

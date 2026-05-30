@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -10,33 +11,6 @@ from typing import Any, Dict, List
 
 from autopipe.config import default_paths
 from autopipe.io_utils import Lock, atomic_write_json, now_ts, read_json
-
-
-def _read_lock_pid(lock_path: Path) -> int | None:
-    try:
-        txt = lock_path.read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return None
-    for line in txt.splitlines():
-        line = line.strip()
-        if line.startswith("pid="):
-            raw = line.split("=", 1)[1].strip()
-            try:
-                return int(raw)
-            except ValueError:
-                return None
-    return None
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Best-effort: if we can't signal it, assume it's alive.
-        return True
 
 
 def list_queue(queue_dir: Path) -> List[Path]:
@@ -102,13 +76,15 @@ def _recover_stale_worker(
     Returns True if the worker was recovered (status updated to failed),
     False if it appears healthy and should be counted as running.
     """
-    # Pre-read current consecutive_failures so stale recovery can increment it
+    # Pre-read current bookkeeping fields so stale recovery can increment them
     # for proper exponential backoff in the scheduler retry loop.
     curr_consecutive = 0
+    curr_attempt = 0
     if run_exp_path.exists():
         try:
             curr = read_json(run_exp_path)
             curr_consecutive = int(curr.get("consecutive_failures", 0))
+            curr_attempt = int(curr.get("attempt", 0))
         except Exception:
             pass
     next_consecutive = curr_consecutive + 1
@@ -119,18 +95,21 @@ def _recover_stale_worker(
         st = read_json(status_path)
         st_status = st.get("status")
         if st_status in {"failed", "success", "hard_failure"}:
-            patch_exp(
-                run_exp_path,
-                base=queue_exp,
+            patch_kwargs: Dict[str, Any] = dict(
                 status=st_status,
                 attempt=st.get("attempt", 0),
                 updated_at=now_ts(),
                 last_exit_code=st.get("exit_code"),
                 last_reason=st.get("reason"),
             )
+            if st_status == "success":
+                patch_kwargs["consecutive_failures"] = 0
+            elif st_status in {"failed", "hard_failure"}:
+                patch_kwargs["last_failed_at"] = last_failed_ts
+            patch_exp(run_exp_path, base=queue_exp, **patch_kwargs)
             if lock_path.exists():
-                pid = _read_lock_pid(lock_path)
-                if pid is None or not _pid_alive(pid):
+                pid = Lock._read_lock_pid(lock_path)
+                if pid is None or not Lock._pid_alive(pid):
                     try:
                         lock_path.unlink(missing_ok=True)
                     except Exception:
@@ -174,6 +153,7 @@ def _recover_stale_worker(
             else:
                 age = 0
         if age > 120:
+            stale_attempt = max(curr_attempt, 1)  # preserve attempt counter, floor at 1
             patch_exp(
                 run_exp_path,
                 base=queue_exp,
@@ -188,7 +168,7 @@ def _recover_stale_worker(
                 {
                     "status": "failed",
                     "updated_at": now_ts(),
-                    "attempt": 0,
+                    "attempt": stale_attempt,
                     "exit_code": 1,
                     "reason": "stale_worker",
                 },
@@ -196,12 +176,13 @@ def _recover_stale_worker(
             return True
 
     # Case 4: Lock exists but recorded PID is dead → clean lock + mark stale.
-    pid = _read_lock_pid(lock_path)
-    if pid is not None and not _pid_alive(pid):
+    pid = Lock._read_lock_pid(lock_path)
+    if pid is not None and not Lock._pid_alive(pid):
         try:
             lock_path.unlink(missing_ok=True)
         except Exception:
             pass
+        stale_attempt = max(curr_attempt, 1)  # preserve attempt counter, floor at 1
         patch_exp(
             run_exp_path,
             base=queue_exp,
@@ -216,7 +197,7 @@ def _recover_stale_worker(
             {
                 "status": "failed",
                 "updated_at": now_ts(),
-                "attempt": 0,
+                "attempt": stale_attempt,
                 "exit_code": 1,
                 "reason": "stale_worker",
             },
@@ -225,80 +206,115 @@ def _recover_stale_worker(
 
     # Worker appears healthy.
     return False
+
+
 def main():
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--repo-root", default=".")
-        ap.add_argument("--poll-seconds", type=int, default=30)
-        ap.add_argument("--max-parallel", type=int, default=1, help="Keep 1 for single-node multi-GPU training.")
-        ap.add_argument("--once", action="store_true", help="Run a single scan iteration and exit.")
-        ap.add_argument(
-            "--no-spawn",
-            action="store_true",
-            help="Do not start new workers (repair/refresh statuses only).",
-        )
-        ap.add_argument(
-            "--force-steal-lock",
-            action="store_true",
-            help="If `.lock_scheduler` exists but the recorded PID is dead, remove it and start.",
-        )
-        args = ap.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo-root", default=".")
+    ap.add_argument("--poll-seconds", type=int, default=30)
+    ap.add_argument("--max-parallel", type=int, default=1, help="Keep 1 for single-node multi-GPU training.")
+    ap.add_argument("--once", action="store_true", help="Run a single scan iteration and exit.")
+    ap.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help="Do not start new workers (repair/refresh statuses only).",
+    )
+    ap.add_argument(
+        "--force-steal-lock",
+        action="store_true",
+        help="If `.lock_scheduler` exists but the recorded PID is dead, remove it and start.",
+    )
+    args = ap.parse_args()
 
-        repo_root = Path(args.repo_root).resolve()
-        paths = default_paths(repo_root)
-        paths.queue_dir.mkdir(parents=True, exist_ok=True)
-        paths.runs_dir.mkdir(parents=True, exist_ok=True)
-        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = Path(args.repo_root).resolve()
+    paths = default_paths(repo_root)
+    paths.queue_dir.mkdir(parents=True, exist_ok=True)
+    paths.runs_dir.mkdir(parents=True, exist_ok=True)
+    paths.logs_dir.mkdir(parents=True, exist_ok=True)
 
-        lock_path = paths.root / ".lock_scheduler"
-        sched_lock = Lock(lock_path, stale_seconds=12 * 3600)
-        if not sched_lock.acquire():
-            if args.force_steal_lock:
-                pid = _read_lock_pid(lock_path)
-                if pid is not None and not _pid_alive(pid):
-                    try:
-                        lock_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    if not sched_lock.acquire():
-                        print("[scheduler] lock busy (failed to steal)", file=sys.stderr)
-                        sys.exit(2)
-                else:
-                    print("[scheduler] already running (pid alive or unreadable)", file=sys.stderr)
+    lock_path = paths.root / ".lock_scheduler"
+    sched_lock = Lock(lock_path, stale_seconds=12 * 3600)
+    if not sched_lock.acquire():
+        if args.force_steal_lock:
+            pid = Lock._read_lock_pid(lock_path)
+            if pid is not None and not Lock._pid_alive(pid):
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                if not sched_lock.acquire():
+                    print("[scheduler] lock busy (failed to steal)", file=sys.stderr)
                     sys.exit(2)
             else:
-                print("[scheduler] already running", file=sys.stderr)
+                print("[scheduler] already running (pid alive or unreadable)", file=sys.stderr)
                 sys.exit(2)
+        else:
+            print("[scheduler] already running", file=sys.stderr)
+            sys.exit(2)
 
-        try:
-            while True:
-                # Health check: if another scheduler stole our lock, exit immediately
-                if not sched_lock.owned():
-                    print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
-                    sys.exit(2)
-                sched_lock.heartbeat()
+    try:
+        # Track spawned worker processes so we can terminate them on shutdown
+        # and avoid leaving orphaned GPU processes if the scheduler is killed.
+        _workers: Dict[str, subprocess.Popen] = {}
 
-                q = list_queue(paths.queue_dir)
-                # Phase 1: refresh statuses / recover stale running workers.
-                running = 0
+        def _reap_workers() -> None:
+            """Remove finished workers from the tracking dict."""
+            stale = [eid for eid, p in _workers.items() if p.poll() is not None]
+            for eid in stale:
+                del _workers[eid]
+
+        def _kill_workers(signum: int | None = None, frame: Any = None) -> None:
+            """Best-effort terminate all tracked workers on scheduler shutdown."""
+            for eid, proc in list(_workers.items()):
+                try:
+                    if proc.poll() is None:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+            # Give them a moment, then SIGKILL.
+            time.sleep(3)
+            for eid, proc in list(_workers.items()):
+                try:
+                    if proc.poll() is None:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _kill_workers)
+        signal.signal(signal.SIGINT, _kill_workers)
+
+        while True:
+            # Health check: if another scheduler stole our lock, exit immediately
+            if not sched_lock.owned():
+                print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
+                sys.exit(2)
+            sched_lock.heartbeat()
+
+            # Drop finished workers from the tracking dict to avoid unbounded growth.
+            _reap_workers()
+
+            q = list_queue(paths.queue_dir)
+            # Phase 1: refresh statuses / recover stale running workers.
+            running = 0
+            for exp_path in q:
+                queue_exp = load_exp(exp_path)
+                run_root = paths.runs_dir / queue_exp["exp_id"]
+                run_exp_path = run_root / "exp.json"
+                exp = _load_run_exp(queue_exp, run_exp_path)
+
+                if exp.get("status") != "running":
+                    continue
+
+                status_path = run_root / "status.json"
+                worker_lock_path = run_root / ".lock_worker"
+                if _recover_stale_worker(run_exp_path, queue_exp, worker_lock_path, status_path):
+                    continue
+
+                running += 1
+
+            if not args.no_spawn:
                 for exp_path in q:
-                    queue_exp = load_exp(exp_path)
-                    run_root = paths.runs_dir / queue_exp["exp_id"]
-                    run_exp_path = run_root / "exp.json"
-                    exp = _load_run_exp(queue_exp, run_exp_path)
-
-                    if exp.get("status") != "running":
-                        continue
-
-                    status_path = run_root / "status.json"
-                    worker_lock_path = run_root / ".lock_worker"
-                    if _recover_stale_worker(run_exp_path, queue_exp, worker_lock_path, status_path):
-                        continue
-
-                    running += 1
-
-                for exp_path in q:
-                    if args.no_spawn:
-                        continue
                     queue_exp = load_exp(exp_path)
                     run_root = paths.runs_dir / queue_exp["exp_id"]
                     run_exp_path = run_root / "exp.json"
@@ -341,7 +357,12 @@ def main():
                         rmtime = run_exp_path.stat().st_mtime if run_exp_path.exists() else 0
                         if qmtime > rmtime:
                             # Queue config was updated — retry is likely intentional.
+                            # Persist the reset to run_exp.json so the worker and status
+                            # inspection tools see a consistent state.
                             attempt = 0
+                            patch_exp(run_exp_path, base=queue_exp,
+                                      attempt=0, consecutive_failures=0,
+                                      status="failed", updated_at=now_ts())
                             status = "failed"
                         else:
                             continue  # no changes detected, keep aborted
@@ -422,14 +443,15 @@ def main():
                     with open(log_path, "ab", buffering=0) as f:
                         f.write(f"\n==== {now_ts()} START {' '.join(cmd)}\n".encode())
                         f.flush()
-                        subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=str(repo_root), env=env)
+                        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=str(repo_root), env=env)
+                        _workers[exp["exp_id"]] = proc
                     running += 1
 
-                if args.once:
-                    break
-                time.sleep(max(1, args.poll_seconds))
-        finally:
-            sched_lock.release()
+            if args.once:
+                break
+            time.sleep(max(1, args.poll_seconds))
+    finally:
+        sched_lock.release()
 
 
 if __name__ == "__main__":

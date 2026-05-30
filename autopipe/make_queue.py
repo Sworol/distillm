@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
@@ -139,8 +140,9 @@ def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
         "train_timeout": spec.get("train_timeout", 86400),
         "skip_vis": spec.get("skip_vis", True),
         "conda_env": spec.get("conda_env", "llm_train"),
-        "hard_failure_threshold": 3,  # allow LLM agent up to 3 repair attempts per error hash
+        "hard_failure_threshold": spec.get("hard_failure_threshold", 3),
         "train_opts": spec.get("train_opts", {}),  # hyperparams that agent can edit
+        "oom_batch_candidates": spec.get("oom_batch_candidates", []),  # batch sizes to try on OOM
     }
 
 
@@ -156,6 +158,11 @@ def main() -> None:
     specs = distillm_specs()
     for i, spec in enumerate(specs):
         exp = build_exp(spec, seq=i + 1)
+        # Validate that bash scripts referenced in the queue entry exist on disk.
+        if exp.get("cmd_type") == "bash":
+            script_path = Path(exp["cmd"].split()[0] if exp["cmd"].split() else exp["cmd"])
+            if not script_path.exists():
+                print(f"WARNING: [{spec['key']}] script not found: {script_path}", file=sys.stderr)
         # Zero-padded numeric prefix enforces execution order in glob sort
         out = paths.queue_dir / f"{exp['seq']:02d}_{exp['exp_id']}.json"
         atomic_write_json(out, exp)

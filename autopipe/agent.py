@@ -50,16 +50,20 @@ def _build_agent_spec(repo_root: str, conda_env: str) -> str:
 def _resolve_agent(agent_cli: str = "auto") -> str:
     """Determine which agent CLI to use. Returns 'claude' or 'codex'."""
     if agent_cli == "claude":
+        if not shutil.which("claude"):
+            raise RuntimeError("agent_cli='claude' but 'claude' CLI not found on PATH")
         return "claude"
     if agent_cli == "codex":
+        if not shutil.which("codex"):
+            raise RuntimeError("agent_cli='codex' but 'codex' CLI not found on PATH")
         return "codex"
     # auto: probe for available CLIs, prefer claude
     if shutil.which("claude"):
         return "claude"
     if shutil.which("codex"):
         return "codex"
-    # Fallback to claude (will fail fast with clear error if missing)
-    return "claude"
+    raise RuntimeError("No agent CLI found on PATH (tried: claude, codex). "
+                       "Install one or set agent_cli in exp.json.")
 
 
 def run_agent(
@@ -84,7 +88,7 @@ def run_agent(
             "--agents", agent_spec,
             "--agent", AGENT_NAME,
             "--allowedTools",
-            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
+            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,rm:*,rmdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
             "-",  # read task from stdin
         ]
     else:

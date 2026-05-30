@@ -83,7 +83,7 @@ worker.py              →  runs bash scripts under conda env, records outcome, 
 2. `scheduler.py` → polls queue, picks `pending`/`failed` items, spawns workers via `subprocess.Popen`; Phase 1 uses unified `_recover_stale_worker()` for stale detection
 3. `worker.py` → infers conda bin via `shutil.which("conda")` (fallback `/anaconda3/envs`), exports `train_opts` as `TRAIN_*` env vars, runs bash script; `train_opts` always a dict
 4. On failure: exponential backoff retry, OOM batch-size auto-reduction, optional LLM agent repair
-5. Error hash: `_last_error_hash()` scans tail+mid 256KB chunks (reuses `_scan_log_chunk`), filters torchrun boilerplate (`error_file`, `childfailederror`)
+5. Error hash: `_last_error_hash()` scans tail+mid 256KB chunks (reuses `scan_log_chunk`), filters torchrun boilerplate (`error_file`, `childfailederror`)
 6. Agent (`agent.py`): invokes `claude` CLI with `--agents '<json-spec>' --agent distillm_debugger`, reads logs → diagnoses root cause → applies fix → writes `fix_summary.txt` → exits
 7. `hard_failure_threshold=3` limits agent repair attempts per unique error hash (prevents infinite repair loops)
 8. Aborted tasks only auto-retry if queue config `mtime > run config mtime` (hotfix detection)
