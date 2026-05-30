@@ -128,6 +128,12 @@ def main() -> None:
 
     try:
         while True:
+            # Health check: if another scheduler stole our lock, exit immediately
+            if not sched_lock.owned():
+                print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
+                sys.exit(2)
+            sched_lock.heartbeat()
+
             q = list_queue(paths.queue_dir)
             # Phase 1: refresh statuses / recover stale running workers.
             running = 0
@@ -155,6 +161,15 @@ def main() -> None:
                             last_exit_code=st.get("exit_code", exp.get("last_exit_code")),
                             last_reason=st.get("reason", exp.get("last_reason")),
                         )
+                        # Clean up stale worker lock if the worker crashed/was killed
+                        # without releasing it (e.g. SIGKILL bypasses finally block).
+                        if lock_path.exists():
+                            pid = _read_lock_pid(lock_path)
+                            if pid is None or not _pid_alive(pid):
+                                try:
+                                    lock_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                         continue
                     if st_status == "running":
                         # A previous attempt may have finished but left `exp.json` stuck at
@@ -272,7 +287,7 @@ def main() -> None:
                         except Exception:
                             pass
 
-                    if attempt >= max_retries:
+                    if attempt > max_retries:
                         patch_exp(run_exp_path, base=queue_exp, status="aborted", updated_at=now_ts())
                         continue
                 if status == "aborted":
@@ -313,7 +328,6 @@ def main() -> None:
                         "hf_endpoint",
                         "train_timeout",
                         "vis_timeout",
-                        "train_opts",
                         "vis_opts",
                         "skip_vis",
                         "retry_sleep",
@@ -322,6 +336,9 @@ def main() -> None:
                         "agent_cli",
                         "hard_failure_threshold",
                     ]
+                    # Note: train_opts is intentionally NOT in merge_keys.
+                    # The agent edits train_opts to fix training failures, and
+                    # scheduler merges would clobber those fixes with queue defaults.
                     changed = False
                     for k in merge_keys:
                         if k in queue_exp and cur.get(k) != queue_exp.get(k):
@@ -330,7 +347,10 @@ def main() -> None:
                     if changed:
                         atomic_write_json(run_exp_path, cur)
 
-                patch_exp(run_exp_path, base=queue_exp, status="running", updated_at=now_ts())
+                # NOTE: The worker sets its own status to "running" after acquiring
+                # the worker lock. We do NOT set it here because if the worker fails
+                # to start (lock busy), exp.json would incorrectly remain "running"
+                # and block future retries.
 
                 cmd = [
                     sys.executable,

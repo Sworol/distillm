@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shlex
 import shutil
 import subprocess
@@ -9,43 +10,42 @@ from typing import Optional
 from autopipe.io_utils import now_ts
 
 
-DEFAULT_PROMPT = """\
-You are a senior ML engineer debugging a failed training experiment for the DistiLLM project (LLM knowledge distillation with DeepSpeed). You have FULL autonomy to read logs, diagnose root causes, AND apply fixes.
+AGENT_NAME = "distillm_debugger"
 
-PROJECT CONTEXT (read once):
-- Repo root: /home/ufile/group_3/zjx/distillm
-- Conda env: exp.json → `conda_env` (typically "llm_train"), bin at /anaconda3/envs/{conda_env}/bin/
-- Training: DeepSpeed ZeRO-1 FP16, 4x RTX 4090 (24GB), gpt2-base (124M) ← gpt2-xlarge (1.5B)
-- Experiments use `cmd_type: "bash"` — the `cmd` field in exp.json points to the shell script
-- Worker prepends conda bin to PATH and sets PYTHONPATH=repo_root before running scripts
-- Data: processed_data/, checkpoints: checkpoints/, results: results/
-- torchrun: /anaconda3/envs/llm_train/bin/torchrun (NOT the system one which goes to openmmlab)
-- Eval expects JSONL: {"prompt": "...", "output": "..."}
-- SINST data has `output` as list (e.g., ['Response 2']), NOT string
+TASK_PROMPT = """\
+Fix the training failure in this experiment directory. Steps:
+1. Read status.json, then attempt_N/train.log (and previous attempts if relevant).
+2. Find the root cause from the traceback (for torchrun: look BEFORE ChildFailedError).
+3. Apply the smallest fix. Prefer editing exp.json "train_opts" (worker exports as TRAIN_* env vars). Then edit shell scripts, install packages, fix data, or edit Python source.
+4. Write a one-line fix summary to fix_summary.txt.
+5. Exit. Do NOT start training."""
 
-TASK (every run):
-1. Read the logs. Start with status.json to see failure classification and exit code, then:
-   - Latest attempt: attempt_N/train.log (the primary log)
-   - Previous attempts: attempt_(N-1)/train.log etc. (to see if this is a recurring or new failure)
-   - agent.log / agent_skip.txt / fix_summary.txt (to see what was tried before — don't repeat failed fixes)
-2. Find the actual error. For torchrun: the real traceback is BEFORE the "ChildFailedError" wrapper. For bash: check if the script produced its own log file (many scripts write to results/*/log.txt as well).
-3. Diagnose root cause by reading referenced files (scripts, configs, data) from the traceback.
-4. Apply the SMALLEST fix that directly addresses the root cause. Do NOT re-try fixes that appear in previous agent.log/fix_summary.txt.
-5. Write a one-line summary to fix_summary.txt.
-6. Exit. Do NOT start training. The scheduler retries automatically.
 
-FIX PRINCIPLES:
-- Prefer: exp.json fields → shell script hyperparameters → install packages → free disk → fix data → Python source
-- Make surgical edits. Do not restructure files.
-- For ANY error: the traceback tells you exactly what went wrong. Read it. Trust it.
-- If you see a path/import error, check if the file/package actually exists before assuming it's missing.
-- If the error is obviously transient (port conflict, network blip, process killed), note it and exit.
-
-TOOLS AT YOUR DISPOSAL:
-- Read/Write/Edit any file in the repo
-- Bash: ls, find, cat, head, tail, grep, wc, cp, mv, mkdir, pip, pip3, python, python3, df, du, nvidia-smi
-- You can install missing packages, check disk space, verify GPU state, test Python imports
-"""
+def _build_agent_spec(repo_root: str, conda_env: str) -> str:
+    """Build JSON agent spec with project context injected into the system prompt."""
+    system_prompt = (
+        "You are a senior ML engineer debugging failed training experiments for "
+        "the DistiLLM project (LLM knowledge distillation with DeepSpeed). "
+        "You have FULL autonomy to read logs, diagnose root causes, AND apply fixes.\n\n"
+        "PROJECT CONTEXT:\n"
+        f"- Repo root: {repo_root}\n"
+        f"- Conda env: {conda_env}, bin at /anaconda3/envs/{conda_env}/bin/\n"
+        "- Training: DeepSpeed ZeRO-1 FP16, 4x RTX 4090 (24GB), gpt2-base (124M) <- gpt2-xlarge (1.5B)\n"
+        "- Experiments use cmd_type bash - the cmd field in exp.json points to the shell script\n"
+        "- Worker exports exp.json train_opts as TRAIN_* env vars before running scripts\n"
+        "- Shell scripts read TRAIN_LR, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_GRADIENT_ACCUMULATION_STEPS with fallback defaults\n"
+        f"- torchrun: /anaconda3/envs/{conda_env}/bin/torchrun (NOT the system one)\n"
+        "- Data: processed_data/, checkpoints: checkpoints/, results: results/\n\n"
+        "FIX PRINCIPLES:\n"
+        "- First: edit exp.json -> train_opts dict (lr, batch_size, epochs, gradient_accumulation_steps). "
+        "Worker exports as TRAIN_* env vars. Fixes persist across retries.\n"
+        "- Then: shell script hyperparameters -> install packages -> free disk -> fix data -> Python source\n"
+        "- Make surgical edits. Do not restructure files.\n"
+        "- Trust the traceback. Read the actual error.\n"
+        "- If error is transient (port conflict, network, killed), note it and exit.\n"
+        "- Check agent.log / fix_summary.txt before fixing - don't repeat failed fixes."
+    )
+    return json.dumps({AGENT_NAME: {"description": "DistiLLM training failure debugger", "prompt": system_prompt}})
 
 
 def _resolve_agent(exp_dir: Path, agent_cli: str = "auto") -> str:
@@ -65,16 +65,15 @@ def _resolve_agent(exp_dir: Path, agent_cli: str = "auto") -> str:
 
 def run_agent(
     exp_dir: Path,
+    repo_root: Path,
     timeout_seconds: int = 600,
     sandbox: str = "danger-full-access",
-    prompt: str = DEFAULT_PROMPT,
     agent_cli: str = "auto",
+    conda_env: str = "llm_train",
 ) -> int:
     """Run agent CLI in exp_dir. Returns exit code."""
     cli = _resolve_agent(exp_dir, agent_cli)
-
-    # exp_dir is autopipe/runs/<exp_id>/, repo_root is two levels up
-    repo_root = exp_dir.parent.parent
+    agent_spec = _build_agent_spec(str(repo_root), conda_env)
 
     if cli == "claude":
         cmd = [
@@ -83,9 +82,11 @@ def run_agent(
             "--no-session-persistence",
             "--permission-mode", "bypassPermissions",
             "--add-dir", str(repo_root),
+            "--agents", agent_spec,
+            "--agent", AGENT_NAME,
             "--allowedTools",
             "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*)",
-            prompt,
+            "-",  # read task from stdin
         ]
     else:
         cmd = [
@@ -93,7 +94,7 @@ def run_agent(
             "exec",
             f"--sandbox={sandbox}",
             "--dangerously-bypass-approvals-and-sandbox",
-            prompt,
+            TASK_PROMPT,
         ]
 
     log_path = exp_dir / "agent.log"
@@ -108,6 +109,8 @@ def run_agent(
                 stderr=subprocess.STDOUT,
                 timeout=timeout_seconds,
                 check=False,
+                input=TASK_PROMPT if cli == "claude" else None,
+                text=True if cli == "claude" else False,
             )
             return int(completed.returncode)
         except subprocess.TimeoutExpired:

@@ -25,10 +25,11 @@ TEACHER_CKPT="${BASE_PATH}/results/gpt2/train/sft_multitask/e10-bs4-lr5e-05-G1-N
 # data (pseudo-labeled data from SeqKD generation, needs tokenization)
 DATA_DIR="${BASE_PATH}/processed_data/combined/pseudo/sft_multitask/"
 LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/10M/"
-# hp
-BATCH_SIZE=2
-LR=0.0005
-GRAD_ACC=1
+# hp (env vars override defaults — autopipe agent edits exp.json → worker exports TRAIN_*)
+BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}
+LR=${TRAIN_LR:-0.0005}
+GRAD_ACC=${TRAIN_GRADIENT_ACCUMULATION_STEPS:-1}
+EPOCHS=${TRAIN_EPOCHS:-20}
 EVAL_BATCH_SIZE=8
 # length
 MAX_LENGTH=512
@@ -61,7 +62,7 @@ OPTS+=" --warmup-iters 0"
 OPTS+=" --lr-decay-style cosine"
 OPTS+=" --weight-decay 1e-2"
 OPTS+=" --clip-grad 1.0"
-OPTS+=" --epochs 20"
+OPTS+=" --epochs ${EPOCHS}"
 OPTS+=" --kd-ratio 1.0"
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"

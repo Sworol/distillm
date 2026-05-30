@@ -27,6 +27,7 @@ def distillm_specs() -> List[Dict[str, Any]]:
         skip_vis=True,
         retry_sleep=60,
         max_retries=1,
+        train_opts=dict(lr=0.0005, batch_size=8, epochs=20, gradient_accumulation_steps=1),
     ))
 
     specs.append(dict(
@@ -74,6 +75,7 @@ def distillm_specs() -> List[Dict[str, Any]]:
         skip_vis=True,
         retry_sleep=60,
         max_retries=1,
+        train_opts=dict(lr=0.0005, batch_size=2, epochs=20, gradient_accumulation_steps=1),
     ))
 
     specs.append(dict(
@@ -99,6 +101,8 @@ def distillm_specs() -> List[Dict[str, Any]]:
         skip_vis=True,
         retry_sleep=60,
         max_retries=1,
+        train_opts=dict(lr=5e-6, batch_size=8, epochs=10, total_iters=5000,
+                        gradient_accumulation_steps=1, chunk_size=16),
     ))
 
     specs.append(dict(
@@ -133,6 +137,7 @@ def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
         "skip_vis": spec.get("skip_vis", True),
         "conda_env": spec.get("conda_env", "llm_train"),
         "hard_failure_threshold": 3,  # allow LLM agent up to 3 repair attempts per error hash
+        "train_opts": spec.get("train_opts", {}),  # hyperparams that agent can edit
     }
 
 

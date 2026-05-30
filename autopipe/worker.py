@@ -385,6 +385,11 @@ def main() -> None:
         # Ensure repo root is on sys.path for scripts that import data_utils etc.
         env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
 
+        # Export train_opts from exp.json as env vars so shell scripts can pick them up.
+        # Agent edits exp.json → worker exports env vars → script uses them (single source of truth).
+        for k, v in exp.get("train_opts", {}).items():
+            env[f"TRAIN_{k.upper()}"] = str(v)
+
         cmd_type = exp.get("cmd_type", "torchrun")
         nproc = int(exp.get("nproc", 4))
         master_port = resolve_master_port(exp) if cmd_type != "bash" else 0
@@ -566,7 +571,7 @@ def main() -> None:
         # Optional auto-repair: run agent inside the experiment run directory.
         # Agent is sandboxed to workspace-write for this experiment directory and should
         # only adjust exp.json for the next attempt.
-        if attempt < int(exp.get("max_retries", 2)):
+        if attempt <= int(exp.get("max_retries", 2)):
             error_hash = _last_error_hash(train_log, vis_log if vis_log.exists() else None)
 
             # Track how many times the agent has attempted to fix each error hash.
@@ -610,7 +615,10 @@ def main() -> None:
             else:
                 try:
                     snapshot_git(repo_root, run_root, "pre_agent")
-                    run_agent(run_root, timeout_seconds=args.agent_timeout, agent_cli=exp.get("agent_cli", "claude"))
+                    run_agent(run_root, repo_root=repo_root,
+                              timeout_seconds=args.agent_timeout,
+                              agent_cli=exp.get("agent_cli", "claude"),
+                              conda_env=exp.get("conda_env", "llm_train"))
                     snapshot_git(repo_root, run_root, "post_agent")
                     # Record that agent ran for this error.
                     agent_fix_hashes[error_hash] = int(agent_fix_hashes.get(error_hash, 0)) + 1

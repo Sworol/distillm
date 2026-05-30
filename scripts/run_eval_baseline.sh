@@ -26,6 +26,7 @@ BENCHMARKS=(
 )
 
 RESULTS_FILE="${SAVE}/${CKPT_NAME}_seed${SEED}.txt"
+mkdir -p "$(dirname "$RESULTS_FILE")"
 echo "${CKPT_NAME} 5-Benchmark (seed=${SEED})" | tee "$RESULTS_FILE"
 echo "Date: $(date)" | tee -a "$RESULTS_FILE"
 echo "Checkpoint: ${CKPT}" | tee -a "$RESULTS_FILE"

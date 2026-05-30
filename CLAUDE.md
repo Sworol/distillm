@@ -69,26 +69,43 @@ The `autopipe/` module provides a self-healing queue-based pipeline runner with 
 ```
 make_queue.py          →  generates queue entries in autopipe/queue/ (numeric prefixed for ordering)
 scheduler.py           →  polls queue, spawns workers (max 1 parallel for single-node multi-GPU)
+  ├─ Phase 1           →  refresh statuses, recover stale workers, clean orphaned locks
+  └─ Phase 2           →  spawn new workers for pending/failed items (exp backoff)
 worker.py              →  runs bash scripts under conda env, records outcome, classifies failures
   ├─ classify_failure  →  15 error patterns (oom, loss_scale, nan, disk_full, hf, net, import,
   │                       port, nccl, path, data, shape, assert, killed, ckpt)
   ├─ OOM auto-reduce   →  halve batch_size, cap at batch_size=1
-  └─ agent.py          →  invoke claude CLI for LLM-powered diagnosis and repair
+  └─ agent.py          →  invoke claude CLI with --agents spec for LLM-powered diagnosis and repair
 ```
 
 ### How it works
 1. `make_queue.py` → generates JSON queue entries in `autopipe/queue/` (numbered `01_`-`08_` for ordering)
-2. `scheduler.py` → polls queue, picks `pending` items, spawns workers via `subprocess.Popen`
-3. `worker.py` → injects conda bin to PATH, sets PYTHONPATH, runs bash script, records success/failed
+2. `scheduler.py` → polls queue, picks `pending`/`failed` items, spawns workers via `subprocess.Popen`
+3. `worker.py` → injects conda bin to PATH, exports `train_opts` as `TRAIN_*` env vars, runs bash script
 4. On failure: exponential backoff retry, OOM batch-size auto-reduction, optional LLM agent repair
-5. Agent (`agent.py`): invokes `claude` CLI with `--add-dir <repo_root> --permission-mode bypassPermissions`, agent reads logs → diagnoses root cause → applies fix → writes `fix_summary.txt` → exits
+5. Agent (`agent.py`): invokes `claude` CLI with `--agents '<json-spec>' --agent distillm_debugger`, reads logs → diagnoses root cause → applies fix → writes `fix_summary.txt` → exits
 6. `hard_failure_threshold=3` limits agent repair attempts per unique error hash (prevents infinite repair loops)
 7. Aborted tasks only auto-retry if queue config `mtime > run config mtime` (hotfix detection)
 
+### Lock & singleton safety
+- `Lock.owned()` — scheduler checks each loop iteration that it still owns `.lock_scheduler`; exits if stolen
+- `Lock.heartbeat()` — updates lock file timestamp each loop so stale detection works correctly
+- Scheduler Phase 1 cleans up stale `.lock_worker` files when status.json shows terminal state but lock file persists (e.g. SIGKILL bypassed worker's `finally` block)
+- **Worker sets its own `status="running"`** after acquiring `.lock_worker` — scheduler does NOT set it, preventing "running but dead" state when worker fails to start
+
+### `train_opts` mechanism
+- Single source of truth: `exp.json → train_opts` dict
+- Worker exports each key as `TRAIN_{KEY_UPPER}` env var before running bash scripts
+- Shell scripts read with fallback: `LR=${TRAIN_LR:-0.0005}`
+- Agent edits `train_opts` in exp.json → fix persists across retries
+- **`train_opts` is excluded from scheduler `merge_keys`** to prevent clobbering agent fixes
+
 ### Agent prompt strategy
 - Principle-based, not exhaustive: agent reads logs itself rather than matching against a pre-enumerated error catalog
+- Project context dynamically injected via `repo_root` and `conda_env` parameters (no hardcoded paths in prompt)
+- Agent invoked via `--agents` JSON spec + `--agent distillm_debugger` (clean, no long prompt on command line)
 - Full repo access: `--add-dir` grants access to scripts, configs, data outside the run directory
-- Fix precedence: exp.json fields → shell script hyperparameters → install packages → free disk → fix data → Python source
+- Fix precedence: exp.json `train_opts` → shell script hyperparameters → install packages → free disk → fix data → Python source
 - Surgical edits only (no restructuring). Agent writes one-line summary, does NOT restart training.
 
 ### Usage

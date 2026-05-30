@@ -26,10 +26,13 @@ PROMPT_DATA_DIR="${BASE_PATH}/processed_data/combined_prompt/gpt2/"
 LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/10M/"
 # runtime
 SAVE_PATH="${BASE_PATH}/results/gpt2/train/minillm_multitask/"
-# hp
-GRAD_ACC=1
-BATCH_SIZE=8
-CHUNK_SIZE=16
+# hp (env vars override defaults — autopipe agent edits exp.json → worker exports TRAIN_*)
+GRAD_ACC=${TRAIN_GRADIENT_ACCUMULATION_STEPS:-1}
+BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
+CHUNK_SIZE=${TRAIN_CHUNK_SIZE:-16}
+LR=${TRAIN_LR:-5e-6}
+EPOCHS=${TRAIN_EPOCHS:-10}
+TOTAL_ITERS=${TRAIN_TOTAL_ITERS:-5000}
 
 
 OPTS=""
@@ -48,12 +51,12 @@ OPTS+=" --lm-data-dir ${LM_DATA_DIR}"
 OPTS+=" --dev-num 3000"
 OPTS+=" --num-workers 4"
 # hp
-OPTS+=" --epochs 10"
-OPTS+=" --total-iters 5000"
+OPTS+=" --epochs ${EPOCHS}"
+OPTS+=" --total-iters ${TOTAL_ITERS}"
 OPTS+=" --kd-ratio 0.5"
 OPTS+=" --batch-size ${BATCH_SIZE}"
-OPTS+=" --lr 5e-6"
-OPTS+=" --lr-min 5e-6"
+OPTS+=" --lr ${LR}"
+OPTS+=" --lr-min ${LR}"
 OPTS+=" --gradient-accumulation-steps ${GRAD_ACC}"
 OPTS+=" --max-length 512"
 OPTS+=" --max-prompt-length 256"

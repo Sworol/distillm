@@ -29,6 +29,7 @@ class Lock:
     def __init__(self, path: Path, stale_seconds: int = 24 * 3600):
         self.path = path
         self.stale_seconds = stale_seconds
+        self._pid: int | None = None
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,6 +38,7 @@ class Lock:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(f"pid={os.getpid()}\n")
                 f.write(f"ts={now_ts()}\n")
+            self._pid = os.getpid()
             return True
         except FileExistsError:
             # Best-effort stale cleanup
@@ -47,6 +49,30 @@ class Lock:
             except FileNotFoundError:
                 pass
             return False
+
+    def owned(self) -> bool:
+        """Return True if the lock file exists and contains our PID."""
+        if self._pid is None:
+            return False
+        try:
+            txt = self.path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return False
+        for line in txt.splitlines():
+            if line.strip().startswith(f"pid={self._pid}"):
+                return True
+        return False
+
+    def heartbeat(self) -> None:
+        """Update the lock file timestamp so stale detection works correctly."""
+        if self.owned():
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_TRUNC)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"pid={self._pid}\n")
+                    f.write(f"ts={now_ts()}\n")
+            except Exception:
+                pass
 
     def release(self) -> None:
         try:

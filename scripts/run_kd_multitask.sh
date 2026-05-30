@@ -27,6 +27,13 @@ DS_CONFIG="${BASE_PATH}/configs/deepspeed/ds_config.json"
 STUDENT_CKPT="${BASE_PATH}/checkpoints/gpt2-base"
 TEACHER_CKPT="${BASE_PATH}/results/gpt2/train/sft_multitask/e10-bs4-lr5e-05-G1-N4-NN1/37220"
 
+# Hyperparameters (env vars override defaults — autopipe agent edits exp.json → worker exports TRAIN_*)
+LR=${TRAIN_LR:-0.0005}
+BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
+EPOCHS=${TRAIN_EPOCHS:-20}
+GRAD_ACC=${TRAIN_GRADIENT_ACCUMULATION_STEPS:-1}
+NUM_WORKERS=${TRAIN_NUM_WORKERS:-4}
+
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
 export TF_CPP_MIN_LOG_LEVEL=3
@@ -51,17 +58,17 @@ ${TORCHRUN} ${DISTRIBUTED_ARGS} "${BASE_PATH}/finetune.py" \
     --teacher-model-type gpt2 \
     --n-gpu ${GPUS_PER_NODE} \
     --data-dir "${DATA_DIR}" \
-    --num-workers 4 \
+    --num-workers ${NUM_WORKERS} \
     --dev-num 3000 \
-    --lr 0.0005 \
-    --batch-size 8 \
+    --lr ${LR} \
+    --batch-size ${BATCH_SIZE} \
     --eval-batch-size 16 \
-    --gradient-accumulation-steps 1 \
+    --gradient-accumulation-steps ${GRAD_ACC} \
     --warmup-iters 0 \
     --lr-decay-style cosine \
     --weight-decay 1e-2 \
     --clip-grad 1.0 \
-    --epochs 20 \
+    --epochs ${EPOCHS} \
     --kd-ratio 1.0 \
     --max-length 512 \
     --max-prompt-length 256 \
