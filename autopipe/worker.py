@@ -379,7 +379,7 @@ def ensure_exp_sane(exp: Dict[str, Any]) -> None:
             raise ValueError(f"invalid master_port: {raw!r}")
 
 
-def _last_error_hash(train_log: Path) -> str:
+def _last_error_hash(run_log: Path) -> str:
     """Extract error fingerprint from log for agent dedup.
 
     Uses ``get_classification_text`` (tail+mid+low chunks, noise-filtered,
@@ -387,9 +387,9 @@ def _last_error_hash(train_log: Path) -> str:
     ``classify_failure`` sees.  Avoids full-file scan for large logs.
     """
     try:
-        if not train_log.exists():
+        if not run_log.exists():
             return ""
-        text = get_classification_text(train_log)
+        text = get_classification_text(run_log)
         if not text:
             return ""
         lines: list[str] = []
@@ -640,7 +640,7 @@ def main() -> None:
 
         env, train_cmd = _prepare_environment(exp, repo_root, attempt)
 
-        train_log = attempt_dir / "train.log"
+        run_log = attempt_dir / "run.log"
         try:
             atomic_write_json(
                 status_path,
@@ -661,7 +661,7 @@ def main() -> None:
             # if the log file stops growing (GPU deadlock, NCCL hang, etc.).
             rc = run_cmd(
                 train_cmd,
-                train_log,
+                run_log,
                 env,
                 timeout_seconds=exp.get("train_timeout", 60 * 60),
                 hang_timeout=exp.get("hang_timeout", 3600),
@@ -669,12 +669,12 @@ def main() -> None:
         except KeyboardInterrupt:
             # Treat Ctrl+C as a "failed" attempt so autopipe can record status and
             # optionally trigger the auto-repair agent.
-            with open(train_log, "ab", buffering=0) as f:
+            with open(run_log, "ab", buffering=0) as f:
                 f.write(f"\n==== {now_ts()} INTERRUPTED (KeyboardInterrupt)\n".encode())
             rc = 130
 
         _handle_outcome(
-            rc, train_log, exp, run_root, run_exp_path, status_path,
+            rc, run_log, exp, run_root, run_exp_path, status_path,
             attempt, train_cmd, env, cmd_type, nproc, repo_root, args.agent_timeout,
         )
     finally:
@@ -683,7 +683,7 @@ def main() -> None:
 
 def _handle_outcome(
     rc: int,
-    train_log: Path,
+    run_log: Path,
     exp: Dict[str, Any],
     run_root: Path,
     run_exp_path: Path,
@@ -716,8 +716,8 @@ def _handle_outcome(
     elif rc == 124:
         reason = "timeout"
     else:
-        reason = classify_failure(train_log)
-    error_hash = _last_error_hash(train_log)
+        reason = classify_failure(run_log)
+    error_hash = _last_error_hash(run_log)
     atomic_write_json(
         status_path,
         {

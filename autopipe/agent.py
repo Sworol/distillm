@@ -13,7 +13,7 @@ AGENT_NAME = "distillm_debugger"
 
 TASK_PROMPT = """\
 Fix the training failure in this experiment directory. Steps:
-1. Read status.json, then attempt_N/train.log (and previous attempts if relevant).
+1. Read status.json, then attempt_N/run.log (and previous attempts if relevant).
 2. Find the root cause from the traceback (for torchrun: look BEFORE ChildFailedError).
 3. Apply the smallest fix. Prefer editing exp.json "train_opts" (worker exports as TRAIN_* env vars). Then edit shell scripts, install packages, fix data, or edit Python source.
 4. Write a one-line fix summary to fix_summary.txt.
