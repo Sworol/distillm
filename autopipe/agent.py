@@ -47,7 +47,7 @@ def _build_agent_spec(repo_root: str, conda_env: str) -> str:
     return json.dumps({AGENT_NAME: {"description": "DistiLLM training failure debugger", "prompt": system_prompt}})
 
 
-def _resolve_agent(exp_dir: Path, agent_cli: str = "auto") -> str:
+def _resolve_agent(agent_cli: str = "auto") -> str:
     """Determine which agent CLI to use. Returns 'claude' or 'codex'."""
     if agent_cli == "claude":
         return "claude"
@@ -71,7 +71,7 @@ def run_agent(
     conda_env: str = "llm_train",
 ) -> int:
     """Run agent CLI in exp_dir. Returns exit code."""
-    cli = _resolve_agent(exp_dir, agent_cli)
+    cli = _resolve_agent(agent_cli)
     agent_spec = _build_agent_spec(str(repo_root), conda_env)
 
     if cli == "claude":
@@ -84,7 +84,7 @@ def run_agent(
             "--agents", agent_spec,
             "--agent", AGENT_NAME,
             "--allowedTools",
-            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*)",
+            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
             "-",  # read task from stdin
         ]
     else:
@@ -117,5 +117,3 @@ def run_agent(
             return 124
 
 
-# Backward-compatible alias
-run_codex = run_agent

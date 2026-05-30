@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -33,22 +34,25 @@ class Lock:
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"pid={os.getpid()}\n")
-                f.write(f"ts={now_ts()}\n")
-            self._pid = os.getpid()
-            return True
-        except FileExistsError:
-            # Best-effort stale cleanup
+        for _ in range(2):
             try:
-                st = self.path.stat()
-                if time.time() - st.st_mtime > self.stale_seconds:
-                    self.path.unlink(missing_ok=True)
-            except FileNotFoundError:
-                pass
-            return False
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"pid={os.getpid()}\n")
+                    f.write(f"ts={now_ts()}\n")
+                self._pid = os.getpid()
+                return True
+            except FileExistsError:
+                # Best-effort stale cleanup
+                try:
+                    st = self.path.stat()
+                    if time.time() - st.st_mtime > self.stale_seconds:
+                        self.path.unlink(missing_ok=True)
+                        continue  # retry acquisition
+                except FileNotFoundError:
+                    pass
+                return False
+        return False
 
     def owned(self) -> bool:
         """Return True if the lock file exists and contains our PID."""
@@ -75,6 +79,8 @@ class Lock:
                 pass
 
     def release(self) -> None:
+        if not self.owned():
+            return
         try:
             self.path.unlink()
         except FileNotFoundError:
@@ -144,7 +150,8 @@ def classify_failure(log_path: Path) -> str:
         return "oom"
     if "loss scale" in combined and ("minimum" in combined or "cannot decrease" in combined):
         return "loss_scale"
-    if "nan" in combined and ("loss" in combined or "gradient" in combined or "tensor" in combined):
+    if (re.search(r"\bnan\b", combined) and
+            ("loss" in combined or "gradient" in combined or "tensor" in combined)):
         return "nan"
     if "no space left on device" in combined or "disk full" in combined:
         return "disk_full"
@@ -165,7 +172,7 @@ def classify_failure(log_path: Path) -> str:
     if ("size mismatch" in combined or "expected size" in combined or "mat1 and mat2" in combined
             or "invalid shape" in combined):
         return "shape"
-    if "assertionerror" in combined or "assert" in combined:
+    if "assertionerror" in combined or "assertion" in combined and ("error" in combined or "failed" in combined):
         return "assert"
     if "sigterm" in combined or "keyboardinterrupt" in combined or "process killed" in combined:
         return "killed"

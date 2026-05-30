@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import shlex
 import socket
 import subprocess
 import signal
@@ -129,8 +130,9 @@ def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
     """
     If an experiment fails with CUDA OOM, reduce batch size for the next attempt.
 
-    This is intentionally conservative and only touches CLI overrides in `train_opts`:
-    - `trainer.data.batch_size=<N>`
+    Handles dict-type `train_opts` (the canonical format from make_queue.py).
+    Looks for batch-size-related keys and sets them to the next smaller candidate
+    from `oom_batch_candidates`.
 
     Returns True if an update was applied (i.e., exp was modified in-memory).
     """
@@ -142,18 +144,21 @@ def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
     except Exception:
         return False
 
-    # Determine current batch size override if present.
+    train_opts = exp.get("train_opts", {})
+    if not isinstance(train_opts, dict):
+        return False
+
+    # Determine current batch size from dict keys.
+    batch_keys = ["batch_size", "per_device_train_batch_size"]
     current: int | None = None
-    for opt in exp.get("train_opts", []):
-        kv = _parse_kv_opt(str(opt))
-        if not kv:
-            continue
-        k, v = kv
-        if k == "trainer.data.batch_size":
+    current_key: str | None = None
+    for key in batch_keys:
+        if key in train_opts:
             try:
-                current = int(v.strip("'\""))
-            except Exception:
-                current = None
+                current = int(train_opts[key])
+                current_key = key
+            except (ValueError, TypeError):
+                pass
             break
 
     # Choose the next smaller candidate.
@@ -170,14 +175,12 @@ def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
     if next_bs is None:
         return False
 
-    # Rewrite train_opts: drop existing batch override, append the new one.
-    new_opts: list[str] = []
-    for opt in exp.get("train_opts", []):
-        if _strip_opt_prefix(str(opt)) == "trainer.data.batch_size":
-            continue
-        new_opts.append(str(opt))
-    new_opts.append(f"trainer.data.batch_size={next_bs}")
-    exp["train_opts"] = new_opts
+    # Update the dict in-place — preserve type so .items() still works downstream.
+    if current_key is not None:
+        train_opts[current_key] = next_bs
+    else:
+        train_opts["batch_size"] = next_bs
+    exp["train_opts"] = train_opts
     exp["last_oom_batch_size"] = next_bs
     return True
 
@@ -426,7 +429,7 @@ def main() -> None:
         ckpt = None
         if cmd_type == "bash":
             # Run a bash script (e.g., distillm shell scripts with their own torchrun)
-            train_cmd = ["bash", exp["cmd"]]
+            train_cmd = ["bash"] + shlex.split(exp["cmd"])
         else:
             train_cmd = [
                 sys.executable,
@@ -564,6 +567,10 @@ def main() -> None:
             reason = "timeout"
         else:
             reason = classify_failure(train_log)
+        error_hash = _last_error_hash(
+            train_log,
+            vis_log if vis_log is not None and vis_log.exists() else None,
+        )
         atomic_write_json(
             status_path,
             {
@@ -580,6 +587,7 @@ def main() -> None:
                 "hf_endpoint": env.get("HF_ENDPOINT"),
                 "nproc": nproc,
                 "master_port": master_port,
+                "error_hash": error_hash,
             },
         )
         exp["status"] = "failed"
@@ -593,6 +601,8 @@ def main() -> None:
             if apply_oom_batch_backoff(exp):
                 exp["status"] = "pending"
                 exp["updated_at"] = now_ts()
+                exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
+                exp["last_failed_at"] = str(time.time())
                 atomic_write_json(run_exp_path, exp)
                 sys.exit(rc)
         atomic_write_json(run_exp_path, exp)
@@ -601,25 +611,25 @@ def main() -> None:
         # Agent is sandboxed to workspace-write for this experiment directory and should
         # only adjust exp.json for the next attempt.
         if attempt <= int(exp.get("max_retries", 2)):
-            error_hash = _last_error_hash(train_log, vis_log if vis_log is not None and vis_log.exists() else None)
 
             # Track how many times the agent has attempted to fix each error hash.
             # If the same hash persists after agent fixes, we bail out to avoid
             # wasting compute on unfixable errors.
             agent_fix_hashes = exp.get("agent_fix_hashes", {})
 
-            prev_hash = ""
-            try:
-                prev_status = read_json(status_path)
-                prev_hash = prev_status.get("error_hash", "")
-            except Exception:
-                pass
+            # Read previous attempt's error hash from exp.json, NOT from the
+            # current status.json (which was just written with the same hash).
+            # This ensures the first occurrence of an error always triggers
+            # the agent; only repeated identical failures are deduplicated.
+            prev_hash = exp.get("error_hash", "")
 
             hard_failure_threshold = int(exp.get("hard_failure_threshold", 2))
 
             if error_hash and error_hash == prev_hash:
-                # Agent already ran for this error; check hard failure threshold.
-                agent_fix_count = int(agent_fix_hashes.get(error_hash, 0))
+                # Agent already ran for this error; increment counter and check hard failure threshold.
+                agent_fix_hashes[error_hash] = int(agent_fix_hashes.get(error_hash, 0)) + 1
+                exp["agent_fix_hashes"] = agent_fix_hashes
+                agent_fix_count = agent_fix_hashes[error_hash]
                 if agent_fix_count >= hard_failure_threshold:
                     exp["status"] = "hard_failure"
                     exp["updated_at"] = now_ts()

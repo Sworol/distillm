@@ -28,6 +28,7 @@ def distillm_specs() -> List[Dict[str, Any]]:
         retry_sleep=60,
         max_retries=1,
         train_opts=dict(lr=0.0005, batch_size=8, epochs=20, gradient_accumulation_steps=1),
+        oom_batch_candidates=[8, 4, 2, 1],
     ))
 
     specs.append(dict(
@@ -76,6 +77,7 @@ def distillm_specs() -> List[Dict[str, Any]]:
         retry_sleep=60,
         max_retries=1,
         train_opts=dict(lr=0.0005, batch_size=2, epochs=20, gradient_accumulation_steps=1),
+        oom_batch_candidates=[2, 1],
     ))
 
     specs.append(dict(
@@ -103,6 +105,7 @@ def distillm_specs() -> List[Dict[str, Any]]:
         max_retries=1,
         train_opts=dict(lr=5e-6, batch_size=8, epochs=10, total_iters=5000,
                         gradient_accumulation_steps=1, chunk_size=16),
+        oom_batch_candidates=[8, 4, 2, 1],
     ))
 
     specs.append(dict(
@@ -130,7 +133,7 @@ def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
         "created_at": now_ts(),
         "status": "pending",
         "attempt": 0,
-        "max_retries": spec.get("max_retries", 1),
+        "max_retries": spec.get("max_retries", 2),
         "retry_sleep": spec.get("retry_sleep", 60),
         "gpus": spec.get("gpus", "0,1,2,3"),
         "train_timeout": spec.get("train_timeout", 86400),
