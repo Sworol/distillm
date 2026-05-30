@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import enum
 import hashlib
 import os
 import shutil
@@ -9,29 +10,31 @@ import socket
 import subprocess
 import signal
 import sys
+import threading
 import time
-import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from autopipe.config import default_paths
+from autopipe.config import HARD_FAILURE_THRESHOLD, default_paths
 from autopipe.io_utils import (
     Lock,
     atomic_write_json,
     classify_failure,
+    get_classification_text,
     now_ts,
     read_json,
-    scan_log_chunk,
 )
 from autopipe.agent import run_agent
-from autopipe.guard import snapshot_git
+from autopipe.git_utils import snapshot_git
 
-# Module-level reference to the currently-running subprocess, so the SIGTERM
-# handler can kill the training process group before the worker exits.
-# If we don't do this, the scheduler's _kill_workers sends SIGTERM to the
-# conda process group, but the training subprocess (start_new_session=True)
-# is in a separate session and becomes an orphan that holds GPU memory.
+# Module-level references to the currently-running subprocess and worker lock,
+# so the SIGTERM handler can clean up GPU processes and release the lock before
+# the worker exits. If we don't kill the subprocess, the scheduler's _kill_workers
+# sends SIGTERM to the conda process group, but the training subprocess
+# (start_new_session=True) is in a separate session and becomes an orphan that
+# holds GPU memory.
 _current_subprocess: subprocess.Popen | None = None
+_worker_lock: "Lock | None" = None
 
 
 def _sigterm_handler(signum: int, frame: Any) -> None:
@@ -42,18 +45,87 @@ def _sigterm_handler(signum: int, frame: Any) -> None:
         except Exception:
             pass
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=2)
         except Exception:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
                 pass
+    # Release the worker lock so the scheduler can clean up immediately
+    # instead of waiting for the 12h stale timeout. Python's default SIGTERM
+    # handler calls _exit() which skips finally blocks, so we must do this here.
+    lock = _worker_lock
+    if lock is not None:
+        try:
+            lock.release()
+        except Exception:
+            pass
     # Restore default handler and re-send so the process terminates normally.
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
 
 
-def run_cmd(cmd: List[str], log_path: Path, env: Dict[str, str]) -> int:
+def _hang_watcher(log_path: Path, proc: subprocess.Popen, hang_timeout: int) -> None:
+    """Daemon thread: kill the training process if the log file stops growing.
+
+    Many training failures manifest as silent hangs (GPU utilization drops to 0,
+    no log output). A wall-clock timeout alone can waste hours of GPU time on a
+    process that is already dead. This watcher checks log file size periodically
+    and sends SIGTERM if no progress is detected within hang_timeout seconds.
+    """
+    last_size = 0
+    try:
+        last_size = log_path.stat().st_size
+    except OSError:
+        pass
+    last_change = time.time()
+    check_interval = min(300, max(30, hang_timeout // 4))
+    while proc.poll() is None:
+        time.sleep(check_interval)
+        try:
+            cur = log_path.stat().st_size
+        except OSError:
+            continue
+        if cur != last_size:
+            last_size = cur
+            last_change = time.time()
+        elif time.time() - last_change > hang_timeout:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            return
+
+
+def _kill_and_wait(proc: subprocess.Popen, exit_code: int) -> int:
+    """Send SIGTERM, wait up to 30 s, then SIGKILL if still alive. Returns exit code."""
+    pgid = os.getpgid(proc.pid)
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except Exception:
+        pass
+    try:
+        return proc.wait(timeout=30)
+    except Exception:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            pass
+        return exit_code
+
+
+def run_cmd(
+    cmd: List[str],
+    log_path: Path,
+    env: Dict[str, str],
+    timeout_seconds: int | None = None,
+    hang_timeout: int | None = None,
+) -> int:
+    """Run a command with optional wall-clock timeout and hang detection.
+
+    - timeout_seconds: max total wall-clock time (None = no limit).
+    - hang_timeout: max seconds without log growth before killing (None = no hang detection).
+    """
     global _current_subprocess
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab", buffering=0) as f:
@@ -67,92 +139,125 @@ def run_cmd(cmd: List[str], log_path: Path, env: Dict[str, str]) -> int:
             env=env,
             start_new_session=True,
         )
+        # Set global BEFORE any I/O so the SIGTERM handler sees the correct
+        # process (no window where the old _current_subprocess is targeted).
         _current_subprocess = proc
-        try:
-            return proc.wait()
-        except KeyboardInterrupt:
-            # Best-effort terminate the whole process group.
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                pass
-            try:
-                return proc.wait(timeout=30)
-            except Exception:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    pass
-                return 130
-        finally:
-            _current_subprocess = None
 
+        # Start hang-detection watcher if configured.
+        watcher = None
+        if hang_timeout and hang_timeout > 0:
+            watcher = threading.Thread(
+                target=_hang_watcher,
+                args=(log_path, proc, hang_timeout),
+                daemon=True,
+            )
+            watcher.start()
 
-def run_cmd_with_timeout(cmd: List[str], log_path: Path, env: Dict[str, str], timeout_seconds: int) -> int:
-    global _current_subprocess
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "ab", buffering=0) as f:
-        f.write(f"\n==== {now_ts()} COMMAND: {' '.join(cmd)}\n".encode())
-        f.flush()
-        proc = subprocess.Popen(
-            cmd,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
-        _current_subprocess = proc
         try:
             return proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             f.write(f"\n==== {now_ts()} TIMEOUT after {timeout_seconds}s\n".encode())
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except Exception:
-                pass
-            try:
-                return proc.wait(timeout=30)
-            except Exception:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except Exception:
-                    pass
-                return 124
+            return _kill_and_wait(proc, 124)
+        except KeyboardInterrupt:
+            return _kill_and_wait(proc, 130)
         finally:
             _current_subprocess = None
 
 
-def run_cmd_maybe_timeout(
-    cmd: List[str],
-    log_path: Path,
-    env: Dict[str, str],
-    timeout_seconds: int | None,
-) -> int:
+def _prepare_environment(
+    exp: Dict[str, Any],
+    repo_root: Path,
+    attempt: int,
+) -> tuple[Dict[str, str], List[str]]:
+    """Build env vars and training command for a single attempt.
+
+    Returns (env, train_cmd) where env is the full os.environ copy with
+    CUDA_VISIBLE_DEVICES, HF_ENDPOINT, PATH injection, PYTHONPATH, and
+    TRAIN_* exports set, and train_cmd is the argv list to execute.
     """
-    Run a command with an optional timeout.
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = exp.get("gpus", "0,1,2,3")
+    env["HF_ENDPOINT"] = exp.get("hf_endpoint", "https://hf-mirror.com")
+    env["AUTOPIPE_EXP_ID"] = str(exp.get("exp_id", ""))
+    env["AUTOPIPE_ATTEMPT"] = str(attempt)
 
-    If timeout_seconds is None or <= 0, run without a wall-clock timeout.
+    # Inject conda env bin into PATH so bash scripts find the right torchrun/python.
+    conda_env = exp.get("conda_env", "")
+    if conda_env:
+        conda_exe = shutil.which("conda")
+        if conda_exe:
+            conda_root = Path(conda_exe).resolve().parent.parent
+            conda_bin = str(conda_root / "envs" / conda_env / "bin")
+        else:
+            conda_bin = f"/anaconda3/envs/{conda_env}/bin"
+        if os.path.isdir(conda_bin):
+            env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
+    # Ensure repo root is on sys.path for scripts that import data_utils etc.
+    env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
+
+    # Export train_opts from exp.json as env vars so shell scripts pick them up.
+    for k, v in exp.get("train_opts", {}).items():
+        env[f"TRAIN_{k.upper()}"] = str(v)
+
+    # Build training command.
+    cmd_type = exp.get("cmd_type", "torchrun")
+    nproc = int(exp.get("nproc", 4))
+    master_port = resolve_master_port(exp) if cmd_type != "bash" else 0
+    if cmd_type == "bash":
+        train_cmd = ["bash"] + shlex.split(exp["cmd"])
+    else:
+        train_cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc_per_node={nproc}",
+            f"--master_port={master_port}",
+            "run.py",
+            "-c",
+            exp["cfg_path"],
+            "-m",
+            "train",
+        ] + [f"{k}={v}" for k, v in exp.get("train_opts", {}).items()]
+
+    return env, train_cmd
+
+
+def _init_attempt(
+    run_root: Path,
+    exp: Dict[str, Any],
+    queue_exp_path: str,
+) -> tuple[int, Path, Path]:
+    """Set up a new attempt: bump counter, create dirs, write running status.
+
+    Returns (attempt, attempt_dir, status_path).
+    Side-effects: writes exp.json and status.json.
     """
-    if timeout_seconds is None:
-        return run_cmd(cmd, log_path, env)
-    try:
-        val = int(timeout_seconds)
-    except Exception:
-        val = 0
-    if val <= 0:
-        return run_cmd(cmd, log_path, env)
-    return run_cmd_with_timeout(cmd, log_path, env, timeout_seconds=val)
+    attempt = int(exp.get("attempt", 0)) + 1
+    attempt_dir = run_root / f"attempt_{attempt:03d}"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    status_path = run_root / "status.json"
 
+    atomic_write_json(
+        status_path,
+        {
+            "status": "running",
+            "updated_at": now_ts(),
+            "attempt": attempt,
+            "exp_id": exp.get("exp_id"),
+            "cfg_path": exp.get("cfg_path"),
+            "trainer": exp.get("trainer"),
+        },
+    )
 
-def _strip_opt_prefix(opt: str) -> str:
-    return opt.split("=", 1)[0].strip() if "=" in opt else opt.strip()
+    exp["attempt"] = attempt
+    exp["status"] = "running"
+    exp["updated_at"] = now_ts()
+    exp["queue_exp_json"] = str(queue_exp_path)
+    atomic_write_json(run_root / "exp.json", exp)
 
-
-def _parse_kv_opt(opt: str) -> tuple[str, str] | None:
-    if "=" not in opt:
-        return None
-    k, v = opt.split("=", 1)
-    return k.strip(), v.strip()
+    # Freeze exp config used for this attempt so snapshots are self-consistent.
+    atomic_write_json(attempt_dir / "exp.json", exp)
+    return attempt, attempt_dir, status_path
 
 
 def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
@@ -162,6 +267,10 @@ def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
     Handles dict-type `train_opts` (the canonical format from make_queue.py).
     Looks for batch-size-related keys and sets them to the next smaller candidate
     from `oom_batch_candidates`.
+
+    If the current batch_size is already the smallest candidate (typically 1),
+    no further reduction is possible — returns False so the normal failure
+    path can escalate to the agent or hard_failure.
 
     Returns True if an update was applied (i.e., exp was modified in-memory).
     """
@@ -190,25 +299,24 @@ def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
                 pass
             break
 
+    if current is None:
+        # No train_opts batch_size key found; can't safely reduce.
+        # Shell scripts have their own hardcoded defaults, and guessing
+        # min(cand_list) may conflict with them, wasting an attempt.
+        return False
+
     # Choose the next smaller candidate.
     cand_list = sorted(set(cand_list), reverse=True)
     next_bs: int | None = None
-    if current is None:
-        # No explicit override; fall back to the smallest candidate as a safe choice.
-        next_bs = min(cand_list)
-    else:
-        for bs in cand_list:
-            if bs < current:
-                next_bs = bs
-                break
+    for bs in cand_list:
+        if bs < current:
+            next_bs = bs
+            break
     if next_bs is None:
         return False
 
-    # Update the dict in-place — preserve type so .items() still works downstream.
-    if current_key is not None:
-        train_opts[current_key] = next_bs
-    else:
-        train_opts["batch_size"] = next_bs
+    # Update the dict in-place.
+    train_opts[current_key] = next_bs
     exp["train_opts"] = train_opts
     exp["last_oom_batch_size"] = next_bs
     return True
@@ -271,100 +379,200 @@ def ensure_exp_sane(exp: Dict[str, Any]) -> None:
             raise ValueError(f"invalid master_port: {raw!r}")
 
 
-def latest_run_dir(repo_root: Path, trainer: str, cfg_path: str) -> Path:
-    runs_dir = repo_root / "runs"
-    slug = cfg_path.replace(".py", "").replace("/", ".").replace(".", "_")
-    pattern = f"{trainer}_{slug}_*"
-    candidates = sorted(runs_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError(f"no run dir for pattern runs/{pattern}")
-    return candidates[0]
+def _last_error_hash(train_log: Path) -> str:
+    """Extract error fingerprint from log for agent dedup.
 
-
-def choose_vis_checkpoint(
-    repo_root: Path,
-    trainer: str,
-    cfg_path: str,
-) -> tuple[Path, Path]:
-    """
-    Pick the checkpoint for visualization.
-
-    Today we rely on the repo's run.py naming convention, so the best we can do
-    without modifying core training code is: select the most-recent run dir for
-    this trainer+cfg.
-    """
-    run_dir = latest_run_dir(repo_root, trainer, cfg_path)
-    ckpt = run_dir / "net.pth"
-    return run_dir, ckpt
-
-
-def _read_autopipe_run_dir(run_dir: Path) -> Path | None:
-    p = run_dir / "autopipe_run.json"
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-    raw = str(data.get("run_dir", "")).strip()
-    if not raw:
-        return None
-    return Path(raw)
-
-
-def _read_autopipe_ckpt_path(run_dir: Path) -> Path | None:
-    p = run_dir / "autopipe_run.json"
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-    raw = str(data.get("ckpt_path", "")).strip()
-    if not raw:
-        return None
-    return Path(raw)
-
-
-def _last_error_hash(train_log: Path, vis_log: Path | None = None) -> str:
-    """Extract error fingerprint from tail+mid chunks for agent dedup.
-
-    Avoids full-file scan (expensive for large logs) and filters torchrun
-    boilerplate lines that don't carry error signal.
+    Uses ``get_classification_text`` (tail+mid+low chunks, noise-filtered,
+    lowercased) so the hash reflects the same cleaned view that
+    ``classify_failure`` sees.  Avoids full-file scan for large logs.
     """
     try:
+        if not train_log.exists():
+            return ""
+        text = get_classification_text(train_log)
+        if not text:
+            return ""
         lines: list[str] = []
-        for log_path in [train_log, vis_log]:
-            if log_path is None or not log_path.exists():
+        for line in text.splitlines():
+            # Skip torchrun boilerplate that always contains "error".
+            if "error_file" in line or "childfailederror" in line:
                 continue
-            try:
-                file_size = log_path.stat().st_size
-            except OSError:
-                continue
-            if file_size == 0:
-                continue
-            # Scan tail 256 KB + mid 256 KB (same strategy as classify_failure).
-            chunks: list[str] = []
-            tail_size = min(256 * 1024, file_size)
-            chunks.append(scan_log_chunk(log_path, file_size - tail_size, tail_size))
-            if file_size > 512 * 1024:
-                mid_start = int(file_size * 0.65)
-                mid_size = min(256 * 1024, file_size - mid_start)
-                chunks.append(scan_log_chunk(log_path, mid_start, mid_size))
-            for chunk in chunks:
-                for line in chunk.splitlines():
-                    lower = line.lower()
-                    # Skip torchrun boilerplate that always contains "error".
-                    if "error_file" in lower or "childfailederror" in lower:
-                        continue
-                    if "error" in lower or "traceback" in lower or "exitcode" in lower:
-                        lines.append(line.strip())
+            if "error" in line or "traceback" in line or "exitcode" in line:
+                lines.append(line.strip())
         # Use last 20 error-bearing lines for a stable hash across DDP ranks
-        # (torchrun may interleave output from different ranks, so 5 lines is
-        # too few to reliably capture the root cause signature).
-        return hashlib.md5("\n".join(lines[-20:]).encode()).hexdigest() if lines else ""
+        # (torchrun may interleave output from different ranks).
+        return hashlib.md5("\n".join(lines[-20:]).encode(), usedforsecurity=False).hexdigest() if lines else ""
     except Exception:
         return ""
+
+
+class RecoveryAction(enum.Enum):
+    """Enumeration of recovery outcomes returned by ``RecoveryManager.handle_failure``.
+
+    The caller inspects the action and performs the appropriate file writes +
+    ``sys.exit()``.  Keeping file I/O in the caller (instead of buried inside
+    ``handle_failure``) makes the three exit paths explicit and testable.
+    """
+    OOM_BACKOFF = "oom_backoff"
+    HARD_FAILURE = "hard_failure"
+    FAILED = "failed"
+
+
+class FailureContext:
+    """Parameter object for ``RecoveryManager.handle_failure``.
+
+    Groups the seven arguments that were previously passed positionally so the
+    call site is readable and the signature is stable across changes.
+    """
+
+    __slots__ = ("exp", "run_exp_path", "status_path", "attempt", "rc", "reason", "error_hash")
+
+    def __init__(
+        self,
+        exp: Dict[str, Any],
+        run_exp_path: Path,
+        status_path: Path,
+        attempt: int,
+        rc: int,
+        reason: str,
+        error_hash: str,
+    ):
+        self.exp = exp
+        self.run_exp_path = run_exp_path
+        self.status_path = status_path
+        self.attempt = attempt
+        self.rc = rc
+        self.reason = reason
+        self.error_hash = error_hash
+
+
+class RecoveryManager:
+    """Manages training failure recovery: OOM backoff, agent repair, error dedup.
+
+    Extracted from ``main()`` to keep the worker's execution and recovery
+    concerns separate.  Handles three paths:
+
+    * **OOM backoff** — reduces batch_size deterministically and returns
+      ``RecoveryAction.OOM_BACKOFF`` so the scheduler retries immediately.
+    * **Hard failure** — when the same error hash survives the agent too many
+      times, returns ``RecoveryAction.HARD_FAILURE``.
+    * **Agent dispatch** — invokes the LLM agent for first-seen errors, or
+      skips it for duplicates below the hard-failure threshold.
+    * **Failed** — returns ``RecoveryAction.FAILED`` and the caller writes the
+      final ``"failed"`` status.
+
+    The caller is responsible for all file writes and ``sys.exit()`` — the
+    manager only mutates the in-memory *exp* dict and returns an action.
+    """
+
+    def __init__(self, run_root: Path, repo_root: Path, agent_timeout: int):
+        self._run_root = run_root
+        self._repo_root = repo_root
+        self._agent_timeout = agent_timeout
+
+    def handle_failure(self, ctx: FailureContext) -> tuple[RecoveryAction, Dict[str, Any]]:
+        """Process a training failure.
+
+        Returns ``(action, exp)`` where *action* is one of
+        ``RecoveryAction.OOM_BACKOFF``, ``RecoveryAction.HARD_FAILURE``, or
+        ``RecoveryAction.FAILED``, and *exp* is the (possibly agent-modified)
+        experiment dict.  The caller must write *exp* to disk and call
+        ``sys.exit(ctx.rc)``.
+        """
+        # ---- OOM deterministic backoff (before agent) -----------------------
+        if ctx.reason == "oom":
+            # Save train_opts before apply_oom_batch_backoff mutates it.
+            # If backoff succeeds but we have exhausted oom retries, we must
+            # roll back the mutation so the stale smaller batch_size doesn't
+            # leak into the next attempt with a stale oom_backoff_count.
+            train_opts_snapshot = dict(ctx.exp.get("train_opts", {}))
+            if apply_oom_batch_backoff(ctx.exp):
+                oom_count = int(ctx.exp.get("oom_backoff_count", 0)) + 1
+                max_oom = int(ctx.exp.get("max_oom_retries", len(ctx.exp.get("oom_batch_candidates", [])) or 0))
+                if oom_count <= max_oom:
+                    ctx.exp["oom_backoff_count"] = oom_count
+                    ctx.exp["attempt"] = ctx.attempt - 1
+                    ctx.exp["consecutive_failures"] = 0
+                    ctx.exp["status"] = "pending"
+                    ctx.exp["updated_at"] = now_ts()
+                    ctx.exp["error_hash"] = ctx.error_hash
+                    ctx.exp["last_failed_at"] = str(time.time())
+                    return RecoveryAction.OOM_BACKOFF, ctx.exp
+                # oom_count > max_oom: rollback the batch_size mutation so we
+                # don't leak a stale smaller value into agent / hard_failure.
+                ctx.exp["train_opts"] = train_opts_snapshot
+                ctx.exp.pop("last_oom_batch_size", None)
+                # fall through to agent / hard_failure.
+            else:
+                # Already at minimum batch_size — track OOM-at-min to bound retries.
+                # Without this counter a no-agent experiment (max_retries=0) OOMing
+                # at batch_size=1 would retry forever.
+                oom_at_min = int(ctx.exp.get("oom_at_min_count", 0)) + 1
+                ctx.exp["oom_at_min_count"] = oom_at_min
+                max_oom = int(ctx.exp.get("max_oom_retries", len(ctx.exp.get("oom_batch_candidates", [])) or 0))
+                if max_oom > 0 and oom_at_min > max_oom:
+                    ctx.exp["status"] = "hard_failure"
+                    ctx.exp["updated_at"] = now_ts()
+                    ctx.exp["last_reason"] = (
+                        f"OOM at minimum batch_size persists after {oom_at_min} attempts"
+                    )
+                    return RecoveryAction.HARD_FAILURE, ctx.exp
+
+        # ---- Agent dispatch (only when retries remain) --------------------
+        if ctx.attempt <= int(ctx.exp.get("max_retries", 2)):
+            agent_fix_hashes = ctx.exp.get("agent_fix_hashes", {})
+            prev_hash = ctx.exp.get("error_hash", "")
+            hard_limit = int(ctx.exp.get("hard_failure_threshold", HARD_FAILURE_THRESHOLD))
+
+            if ctx.error_hash and ctx.error_hash == prev_hash:
+                # Agent already ran for this hash — increment counter.
+                agent_fix_hashes[ctx.error_hash] = int(agent_fix_hashes.get(ctx.error_hash, 0)) + 1
+                ctx.exp["agent_fix_hashes"] = agent_fix_hashes
+                agent_fix_count = agent_fix_hashes[ctx.error_hash]
+                if agent_fix_count >= hard_limit:
+                    ctx.exp["status"] = "hard_failure"
+                    ctx.exp["updated_at"] = now_ts()
+                    ctx.exp["last_reason"] = (
+                        f"agent failed to fix '{ctx.reason}' "
+                        f"after {agent_fix_count} attempts (hash={ctx.error_hash})"
+                    )
+                    return RecoveryAction.HARD_FAILURE, ctx.exp
+
+                with open(self._run_root / "agent_skip.txt", "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{now_ts()} skipped agent "
+                        f"(duplicate error {ctx.error_hash}, agent_fix_count={agent_fix_count})\n"
+                    )
+            else:
+                # First time seeing this error — run the agent.
+                try:
+                    snapshot_git(self._repo_root, self._run_root, "pre_agent")
+                    run_agent(
+                        self._run_root,
+                        repo_root=self._repo_root,
+                        timeout_seconds=self._agent_timeout,
+                        agent_cli=ctx.exp.get("agent_cli", "claude"),
+                        conda_env=ctx.exp.get("conda_env", "llm_train"),
+                    )
+                    snapshot_git(self._repo_root, self._run_root, "post_agent")
+                    agent_fix_hashes[ctx.error_hash] = int(agent_fix_hashes.get(ctx.error_hash, 0)) + 1
+                    # Re-read exp.json so agent edits (train_opts, etc.) are visible.
+                    # IMPORTANT: if the re-read fails we keep the old exp AND log a
+                    # warning — previously we silently clobbered agent fixes on error.
+                    try:
+                        ctx.exp = read_json(ctx.run_exp_path)
+                    except Exception as read_exc:
+                        with open(self._run_root / "agent_error.txt", "a", encoding="utf-8") as f:
+                            f.write(
+                                f"{now_ts()} WARNING: failed to re-read exp.json after agent — "
+                                f"agent fixes may be lost: {repr(read_exc)}\n"
+                            )
+                    ctx.exp["agent_fix_hashes"] = agent_fix_hashes
+                except Exception as exc:
+                    with open(self._run_root / "agent_error.txt", "a", encoding="utf-8") as f:
+                        f.write(f"{now_ts()} {repr(exc)}\n")
+
+        return RecoveryAction.FAILED, ctx.exp
 
 
 def main() -> None:
@@ -386,12 +594,34 @@ def main() -> None:
         # First run: copy queue definition into per-exp working config.
         atomic_write_json(run_exp_path, queue_exp)
     exp = read_json(run_exp_path)
-    ensure_exp_sane(exp)
+    try:
+        ensure_exp_sane(exp)
+    except ValueError as exc:
+        # Validation errors are not retryable — mark hard_failure immediately
+        # so the scheduler doesn't loop forever on a misconfigured experiment.
+        exp["status"] = "hard_failure"
+        exp["last_reason"] = f"validation_error: {exc}"
+        exp["updated_at"] = now_ts()
+        atomic_write_json(run_exp_path, exp)
+        atomic_write_json(
+            run_root / "status.json",
+            {
+                "status": "hard_failure",
+                "updated_at": now_ts(),
+                "attempt": 0,
+                "exit_code": 1,
+                "reason": f"validation_error: {exc}",
+            },
+        )
+        print(f"[worker] hard_failure: {exc}", file=sys.stderr)
+        sys.exit(1)
 
+    global _worker_lock
     lock = Lock(run_root / ".lock_worker", stale_seconds=12 * 3600)
     if not lock.acquire():
         print(f"[worker] lock busy: {run_root}", file=sys.stderr)
         sys.exit(2)
+    _worker_lock = lock
 
     # Ensure GPU processes are killed if the worker receives SIGTERM.
     # Without this, the training subprocess (start_new_session=True) would be
@@ -399,88 +629,16 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
     try:
-        status_path = run_root / "status.json"
-        attempt = int(exp.get("attempt", 0)) + 1
-        attempt_dir = run_root / f"attempt_{attempt:03d}"
-        attempt_dir.mkdir(parents=True, exist_ok=True)
-
-        atomic_write_json(
-            status_path,
-            {
-                "status": "running",
-                "updated_at": now_ts(),
-                "attempt": attempt,
-                "exp_id": exp.get("exp_id"),
-                "cfg_path": exp.get("cfg_path"),
-                "trainer": exp.get("trainer"),
-            },
-        )
-        # Update attempt counter in the working exp config so agent/scheduler see progress.
-        exp["attempt"] = attempt
-        exp["status"] = "running"
-        exp["updated_at"] = now_ts()
-        exp["queue_exp_json"] = str(queue_exp_path)
-        atomic_write_json(run_exp_path, exp)
-
-        # Freeze exp config used for this attempt (copy from updated run_root/exp.json).
-        # This avoids confusing snapshots where `attempt_XXX/exp.json` contains the
-        # previous attempt number.
-        atomic_write_json(attempt_dir / "exp.json", exp)
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = exp.get("gpus", "0,1,2,3")
-        # Force hf mirror endpoint to avoid relying on user shell environment.
-        env["HF_ENDPOINT"] = exp.get("hf_endpoint", "https://hf-mirror.com")
-        env["AUTOPIPE_EXP_ID"] = str(exp.get("exp_id", ""))
-        env["AUTOPIPE_ATTEMPT"] = str(attempt)
-
-        # Inject conda env bin into PATH so bash scripts find the right torchrun/python.
-        conda_env = exp.get("conda_env", "")
-        if conda_env:
-            conda_exe = shutil.which("conda")
-            if conda_exe:
-                # Infer envs root from the conda executable location.
-                # Typical layout: /path/to/conda/bin/conda -> envs dir is ../envs
-                conda_root = Path(conda_exe).resolve().parent.parent
-                conda_bin = str(conda_root / "envs" / conda_env / "bin")
-            else:
-                conda_bin = f"/anaconda3/envs/{conda_env}/bin"
-            if os.path.isdir(conda_bin):
-                env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
-                # Ensure conda env python is discoverable as `python` (some scripts don't use python3).
-                if os.path.exists(f"{conda_bin}/python"):
-                    env["CONDA_PYTHON"] = f"{conda_bin}/python"
-        # Ensure repo root is on sys.path for scripts that import data_utils etc.
-        env["PYTHONPATH"] = str(repo_root) + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
-
-        # Export train_opts from exp.json as env vars so shell scripts can pick them up.
-        # Agent edits exp.json → worker exports env vars → script uses them (single source of truth).
-        for k, v in exp.get("train_opts", {}).items():
-            env[f"TRAIN_{k.upper()}"] = str(v)
-
         cmd_type = exp.get("cmd_type", "torchrun")
         nproc = int(exp.get("nproc", 4))
-        master_port = resolve_master_port(exp) if cmd_type != "bash" else 0
-        vis_cmd = None
-        rc_vis = None
-        run_dir = None
-        ckpt = None
-        if cmd_type == "bash":
-            # Run a bash script (e.g., distillm shell scripts with their own torchrun)
-            train_cmd = ["bash"] + shlex.split(exp["cmd"])
-        else:
-            train_cmd = [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                f"--nproc_per_node={nproc}",
-                f"--master_port={master_port}",
-                "run.py",
-                "-c",
-                exp["cfg_path"],
-                "-m",
-                "train",
-            ] + [f"{k}={v}" for k, v in exp.get("train_opts", {}).items()]
+        # Resolve master_port once for both the training command and status.json.
+        # _prepare_environment will pick up the same value via resolve_master_port.
+        if cmd_type != "bash":
+            exp["master_port"] = resolve_master_port(exp)
+
+        attempt, attempt_dir, status_path = _init_attempt(run_root, exp, str(queue_exp_path))
+
+        env, train_cmd = _prepare_environment(exp, repo_root, attempt)
 
         train_log = attempt_dir / "train.log"
         try:
@@ -499,14 +657,14 @@ def main() -> None:
                     "cmd_type": cmd_type,
                 },
             )
-            # Guard against "silent hangs" during model build / extension compilation.
-            # If the training process doesn't make progress for too long, terminate and
-            # let the agent/scheduler retry with an updated config.
-            rc = run_cmd_maybe_timeout(
+            # Wall-clock timeout caps total run time; hang_timeout kills the process
+            # if the log file stops growing (GPU deadlock, NCCL hang, etc.).
+            rc = run_cmd(
                 train_cmd,
                 train_log,
                 env,
                 timeout_seconds=exp.get("train_timeout", 60 * 60),
+                hang_timeout=exp.get("hang_timeout", 3600),
             )
         except KeyboardInterrupt:
             # Treat Ctrl+C as a "failed" attempt so autopipe can record status and
@@ -515,238 +673,120 @@ def main() -> None:
                 f.write(f"\n==== {now_ts()} INTERRUPTED (KeyboardInterrupt)\n".encode())
             rc = 130
 
-        # If training succeeded, run visualization using that run's net.pth.
-        vis_log = None
-        if rc == 0 and not exp.get("skip_vis", False) and cmd_type != "bash":
-            vis_log = attempt_dir / "vis.log"
-            run_dir, ckpt = choose_vis_checkpoint(
-                repo_root=repo_root,
-                trainer=exp["trainer"],
-                cfg_path=exp["cfg_path"],
-            )
-            # If training recorded an explicit run_dir pointer, prefer it.
-            recorded = _read_autopipe_run_dir(run_dir)
-            if recorded is not None:
-                run_dir = recorded
-                # Prefer an explicitly recorded ckpt_path if present.
-                ckpt_recorded = _read_autopipe_ckpt_path(run_dir)
-                ckpt = ckpt_recorded if ckpt_recorded is not None else (run_dir / "net.pth")
-            if not ckpt.exists():
-                raise FileNotFoundError(f"missing net.pth: {ckpt}")
-            vis_dir = attempt_dir / "vis"
-            if vis_dir.exists():
-                shutil.rmtree(vis_dir)
-            vis_dir.mkdir(parents=True, exist_ok=True)
-            vis_cmd = [
-                sys.executable,
-                "run.py",
-                "-c",
-                exp["cfg_path"],
-                "-m",
-                "test",
-                f"vis_dir={vis_dir.as_posix()}",
-                f"model.checkpoint_path={ckpt.as_posix()}",
-            ] + list(exp.get("vis_opts", []))
-            try:
-                atomic_write_json(
-                    status_path,
-                    {
-                        "status": "running",
-                        "updated_at": now_ts(),
-                        "attempt": attempt,
-                        "exp_id": exp.get("exp_id"),
-                        "cfg_path": exp.get("cfg_path"),
-                        "trainer": exp.get("trainer"),
-                        "train_cmd": train_cmd,
-                        "vis_cmd": vis_cmd,
-                        "run_dir": str(run_dir),
-                        "ckpt_path": str(ckpt),
-                        "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES"),
-                        "hf_endpoint": env.get("HF_ENDPOINT"),
-                        "nproc": nproc,
-                        "master_port": master_port,
-                    },
-                )
-                rc_vis = run_cmd_with_timeout(
-                    vis_cmd,
-                    vis_log,
-                    env,
-                    timeout_seconds=int(exp.get("vis_timeout", 60 * 60)),
-                )
-            except KeyboardInterrupt:
-                with open(vis_log, "ab", buffering=0) as f:
-                    f.write(f"\n==== {now_ts()} INTERRUPTED (KeyboardInterrupt)\n".encode())
-                rc_vis = 130
-
-        if rc == 0:
-            vis_failed = rc_vis is not None and rc_vis != 0
-            atomic_write_json(
-                status_path,
-                {
-                    "status": "success",
-                    "updated_at": now_ts(),
-                    "attempt": attempt,
-                    "run_dir": str(run_dir) if run_dir is not None else None,
-                    "ckpt_path": str(ckpt) if ckpt is not None else None,
-                    "vis_exit_code": rc_vis if rc_vis is not None else None,
-                    "vis_failed": vis_failed,
-                },
-            )
-            exp["status"] = "success"
-            exp["updated_at"] = now_ts()
-            exp["consecutive_failures"] = 0
-            exp["error_hash"] = ""
-            exp["last_failed_at"] = ""
-            if run_dir is not None:
-                exp["last_run_dir"] = str(run_dir)
-            atomic_write_json(run_exp_path, exp)
-            sys.exit(0)
-
-        if rc == 130:
-            reason = "interrupted"
-        elif rc == 124:
-            reason = "timeout"
-        else:
-            reason = classify_failure(train_log)
-        error_hash = _last_error_hash(
-            train_log,
-            vis_log if vis_log is not None and vis_log.exists() else None,
+        _handle_outcome(
+            rc, train_log, exp, run_root, run_exp_path, status_path,
+            attempt, train_cmd, env, cmd_type, nproc, repo_root, args.agent_timeout,
         )
+    finally:
+        lock.release()
+
+
+def _handle_outcome(
+    rc: int,
+    train_log: Path,
+    exp: Dict[str, Any],
+    run_root: Path,
+    run_exp_path: Path,
+    status_path: Path,
+    attempt: int,
+    train_cmd: List[str],
+    env: Dict[str, str],
+    cmd_type: str,
+    nproc: int,
+    repo_root: Path,
+    agent_timeout: int,
+) -> None:
+    """Process the training result.  Always ends with ``sys.exit()``."""
+    if rc == 0:
+        atomic_write_json(
+            status_path,
+            {"status": "success", "updated_at": now_ts(), "attempt": attempt},
+        )
+        exp["status"] = "success"
+        exp["updated_at"] = now_ts()
+        exp["consecutive_failures"] = 0
+        exp["error_hash"] = ""
+        exp["last_failed_at"] = ""
+        atomic_write_json(run_exp_path, exp)
+        sys.exit(0)
+
+    # ---- Failure classification & recording ----------------------------
+    if rc == 130:
+        reason = "interrupted"
+    elif rc == 124:
+        reason = "timeout"
+    else:
+        reason = classify_failure(train_log)
+    error_hash = _last_error_hash(train_log)
+    atomic_write_json(
+        status_path,
+        {
+            "status": "failed",
+            "updated_at": now_ts(),
+            "attempt": attempt,
+            "exit_code": rc,
+            "reason": reason,
+            "train_cmd": train_cmd,
+            "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES"),
+            "hf_endpoint": env.get("HF_ENDPOINT"),
+            "nproc": nproc,
+            "master_port": exp.get("master_port", 0),
+            "error_hash": error_hash,
+        },
+    )
+
+    # ---- Recovery ------------------------------------------------------
+    recovery = RecoveryManager(run_root, repo_root, agent_timeout)
+    ctx = FailureContext(
+        exp=exp, run_exp_path=run_exp_path, status_path=status_path,
+        attempt=attempt, rc=rc, reason=reason, error_hash=error_hash,
+    )
+    action, exp = recovery.handle_failure(ctx)
+
+    if action == RecoveryAction.OOM_BACKOFF:
+        atomic_write_json(run_exp_path, exp)
         atomic_write_json(
             status_path,
             {
-                "status": "failed",
-                "updated_at": now_ts(),
-                "attempt": attempt,
-                "exit_code": rc,
-                "reason": reason,
-                "train_cmd": train_cmd,
-                "vis_cmd": vis_cmd if vis_cmd is not None else None,
-                "run_dir": str(run_dir) if run_dir is not None else None,
-                "ckpt_path": str(ckpt) if ckpt is not None else None,
-                "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES"),
-                "hf_endpoint": env.get("HF_ENDPOINT"),
-                "nproc": nproc,
-                "master_port": master_port,
+                "status": "pending", "updated_at": now_ts(),
+                "attempt": exp["attempt"],
+                "reason": "oom_backoff",
+                "oom_backoff_count": exp.get("oom_backoff_count", 0),
                 "error_hash": error_hash,
             },
         )
-        exp["status"] = "failed"
-        exp["updated_at"] = now_ts()
-        exp["last_exit_code"] = rc
-        exp["last_reason"] = reason
-
-        # If we hit OOM, prefer a deterministic, config-driven batch backoff over
-        # an LLM "repair" attempt. This keeps retries fast and reproducible.
-        #
-        # Note: we do NOT increment `consecutive_failures` here because a deterministic
-        # batch-size reduction is not a "failure" for backoff purposes. The scheduler
-        # sees status="pending" and retries immediately (skipping the "failed" cooldown).
-        if reason == "oom":
-            if apply_oom_batch_backoff(exp):
-                # Don't consume an attempt for deterministic batch-size backoff.
-                # The scheduler skips exponential backoff for "pending" status,
-                # so the retry is immediate and doesn't count toward max_retries.
-                exp["attempt"] = attempt - 1
-                exp["status"] = "pending"
-                exp["updated_at"] = now_ts()
-                exp["error_hash"] = error_hash
-                exp["last_failed_at"] = str(time.time())
-                atomic_write_json(run_exp_path, exp)
-                sys.exit(rc)
-
-        # Optional auto-repair: run agent inside the experiment run directory.
-        # Agent is sandboxed to workspace-write for this experiment directory and should
-        # only adjust exp.json for the next attempt.
-        if attempt <= int(exp.get("max_retries", 2)):
-
-            # Track how many times the agent has attempted to fix each error hash.
-            # If the same hash persists after agent fixes, we bail out to avoid
-            # wasting compute on unfixable errors.
-            agent_fix_hashes = exp.get("agent_fix_hashes", {})
-
-            # Read previous attempt's error hash from exp.json, NOT from the
-            # current status.json (which was just written with the same hash).
-            # This ensures the first occurrence of an error always triggers
-            # the agent; only repeated identical failures are deduplicated.
-            prev_hash = exp.get("error_hash", "")
-
-            hard_failure_threshold = int(exp.get("hard_failure_threshold", 2))
-
-            if error_hash and error_hash == prev_hash:
-                # Agent already ran for this error; increment counter and check hard failure threshold.
-                agent_fix_hashes[error_hash] = int(agent_fix_hashes.get(error_hash, 0)) + 1
-                exp["agent_fix_hashes"] = agent_fix_hashes
-                agent_fix_count = agent_fix_hashes[error_hash]
-                if agent_fix_count >= hard_failure_threshold:
-                    exp["status"] = "hard_failure"
-                    exp["updated_at"] = now_ts()
-                    exp["last_reason"] = f"agent failed to fix '{reason}' after {agent_fix_count} attempts (hash={error_hash})"
-                    atomic_write_json(run_exp_path, exp)
-                    atomic_write_json(
-                        status_path,
-                        {
-                            "status": "hard_failure",
-                            "updated_at": now_ts(),
-                            "attempt": attempt,
-                            "exit_code": rc,
-                            "reason": f"agent_fix_exhausted:{reason}",
-                            "error_hash": error_hash,
-                            "agent_fix_count": agent_fix_count,
-                        },
-                    )
-                    sys.exit(rc)
-
-                with open(run_root / "agent_skip.txt", "a", encoding="utf-8") as f:
-                    f.write(f"{now_ts()} skipped agent (duplicate error {error_hash}, agent_fix_count={agent_fix_count})\n")
-            else:
-                try:
-                    snapshot_git(repo_root, run_root, "pre_agent")
-                    run_agent(run_root, repo_root=repo_root,
-                              timeout_seconds=args.agent_timeout,
-                              agent_cli=exp.get("agent_cli", "claude"),
-                              conda_env=exp.get("conda_env", "llm_train"))
-                    snapshot_git(repo_root, run_root, "post_agent")
-                    # Record that agent ran for this error.
-                    agent_fix_hashes[error_hash] = int(agent_fix_hashes.get(error_hash, 0)) + 1
-                    # Re-read exp.json to preserve agent edits (train_opts etc.).
-                    # The final write below must include agent changes.
-                    try:
-                        exp = read_json(run_exp_path)
-                    except Exception:
-                        pass
-                    exp["agent_fix_hashes"] = agent_fix_hashes
-                    # Re-apply status fields set before the agent block (lost on re-read).
-                    exp["status"] = "failed"
-                    exp["last_exit_code"] = rc
-                    exp["last_reason"] = reason
-                except Exception as exc:
-                    # Agent is best-effort; keep the failure recorded and let scheduler retry.
-                    with open(run_root / "agent_error.txt", "a", encoding="utf-8") as f:
-                        f.write(f"{now_ts()} {repr(exc)}\n")
-
-        # Update error tracking for backoff and dedup.
-        # Written once after the agent block so the scheduler never reads a partial
-        # state (no intermediate write between classification and agent completion).
-        exp["status"] = "failed"
-        exp["updated_at"] = now_ts()
-        exp["last_exit_code"] = rc
-        exp["last_reason"] = reason
-        exp["error_hash"] = error_hash
-        exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
-        exp["last_failed_at"] = str(time.time())
-        atomic_write_json(run_exp_path, exp)
-
-        # Also update status.json so next attempt can dedup.
-        try:
-            st = read_json(status_path)
-            st["error_hash"] = error_hash
-            atomic_write_json(status_path, st)
-        except Exception:
-            pass
         sys.exit(rc)
-    finally:
-        lock.release()
+
+    if action == RecoveryAction.HARD_FAILURE:
+        atomic_write_json(run_exp_path, exp)
+        atomic_write_json(
+            status_path,
+            {
+                "status": "hard_failure", "updated_at": now_ts(),
+                "attempt": attempt, "exit_code": rc,
+                "reason": exp.get("last_reason", f"hard_failure:{reason}"),
+                "error_hash": error_hash,
+            },
+        )
+        sys.exit(rc)
+
+    # RecoveryAction.FAILED
+    exp["status"] = "failed"
+    exp["updated_at"] = now_ts()
+    exp["last_exit_code"] = rc
+    exp["last_reason"] = reason
+    exp["error_hash"] = error_hash
+    exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
+    exp["last_failed_at"] = str(time.time())
+    atomic_write_json(run_exp_path, exp)
+
+    try:
+        st = read_json(status_path)
+        st["error_hash"] = error_hash
+        atomic_write_json(status_path, st)
+    except Exception:
+        pass
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

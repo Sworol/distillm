@@ -5,7 +5,6 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from autopipe.io_utils import now_ts
 
@@ -21,9 +20,9 @@ Fix the training failure in this experiment directory. Steps:
 5. Exit. Do NOT start training."""
 
 
-def _build_agent_spec(repo_root: str, conda_env: str) -> str:
-    """Build JSON agent spec with project context injected into the system prompt."""
-    system_prompt = (
+def _build_system_prompt(repo_root: str, conda_env: str) -> str:
+    """Build the agent system prompt with project context injected."""
+    return (
         "You are a senior ML engineer debugging failed training experiments for "
         "the DistiLLM project (LLM knowledge distillation with DeepSpeed). "
         "You have FULL autonomy to read logs, diagnose root causes, AND apply fixes.\n\n"
@@ -44,6 +43,11 @@ def _build_agent_spec(repo_root: str, conda_env: str) -> str:
         "- If error is transient (port conflict, network, killed), note it and exit.\n"
         "- Check agent.log / fix_summary.txt before fixing - don't repeat failed fixes."
     )
+
+
+def _build_agent_spec(repo_root: str, conda_env: str) -> str:
+    """Build JSON agent spec for the --agents CLI flag."""
+    system_prompt = _build_system_prompt(repo_root, conda_env)
     return json.dumps({AGENT_NAME: {"description": "DistiLLM training failure debugger", "prompt": system_prompt}})
 
 
@@ -63,7 +67,7 @@ def _resolve_agent(agent_cli: str = "auto") -> str:
     if shutil.which("codex"):
         return "codex"
     raise RuntimeError("No agent CLI found on PATH (tried: claude, codex). "
-                       "Install one or set agent_cli in exp.json.")
+                       "Install one or pass agent_cli='claude'/'codex' explicitly.")
 
 
 def run_agent(
@@ -76,34 +80,38 @@ def run_agent(
 ) -> int:
     """Run agent CLI in exp_dir. Returns exit code."""
     cli = _resolve_agent(agent_cli)
-    agent_spec = _build_agent_spec(str(repo_root), conda_env)
 
     if cli == "claude":
+        agent_spec = _build_agent_spec(str(repo_root), conda_env)
         cmd = [
             "claude",
             "-p",
             "--no-session-persistence",
-            "--permission-mode", "bypassPermissions",
+            "--dangerously-skip-permissions",
             "--add-dir", str(repo_root),
             "--agents", agent_spec,
             "--agent", AGENT_NAME,
             "--allowedTools",
-            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,wc:*,cp:*,mv:*,mkdir:*,rm:*,rmdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
+            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,rg:*,wc:*,cp:*,mv:*,mkdir:*,rm:*,rmdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
             "-",  # read task from stdin
         ]
     else:
+        # codex: inject project context directly into the prompt (same context
+        # that the claude path gets via --agents).
+        system_prompt = _build_system_prompt(str(repo_root), conda_env)
+        full_prompt = system_prompt + "\n\nTASK:\n" + TASK_PROMPT
         cmd = [
             "codex",
             "exec",
             f"--sandbox={sandbox}",
             "--dangerously-bypass-approvals-and-sandbox",
-            TASK_PROMPT,
+            full_prompt,
         ]
 
     log_path = exp_dir / "agent.log"
     with open(log_path, "ab", buffering=0) as f:
         f.write(f"\n==== {now_ts()} AGENT_START ({cli}): {' '.join(shlex.quote(str(x)) for x in cmd)}\n".encode())
-        f.flush()
+        # buffering=0 above already ensures unbuffered writes; no need for flush()
         try:
             completed = subprocess.run(
                 cmd,

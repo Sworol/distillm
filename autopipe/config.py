@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+# Default max number of agent repair attempts for a single unique error hash
+# before marking the experiment as hard_failure.  Used by both make_queue and
+# the worker; keep them in sync via this single constant.
+HARD_FAILURE_THRESHOLD = 3
+
 
 @dataclass(frozen=True)
 class Paths:

@@ -5,7 +5,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -15,6 +15,22 @@ def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def patch_exp(path: Path, base: Dict[str, Any] | None = None, **updates: Any) -> Dict[str, Any]:
+    """Atomically patch a JSON file, updating only *updates* keys.
+
+    Used by both the scheduler and stale-worker recovery to safely update
+    ``exp.json`` without clobbering fields written by the worker or agent.
+    """
+    if path.exists():
+        exp = read_json(path)
+    else:
+        exp = dict(base or {})
+    for k, v in updates.items():
+        exp[k] = v
+    atomic_write_json(path, exp)
+    return exp
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -161,6 +177,92 @@ def scan_log_chunk(path: Path, start_pos: int, chunk_size: int) -> str:
         return ""
 
 
+def scan_log_tail_mid(log_path: Path) -> list[str]:
+    """Return up to three text chunks from *log_path* for error scanning.
+
+    Coverage strategy — three overlapping windows so errors are found
+    regardless of where they land in large logs:
+
+    * tail: last 256 KB (always included — torchrun ChildFailedError lands here)
+    * mid:  256 KB around the 65 % mark (for large logs > 512 KB)
+    * low:  256 KB around the 25 % mark (for large logs > 512 KB)
+
+    Used by both ``classify_failure`` and ``_last_error_hash`` so the
+    scanning strategy stays consistent.
+    """
+    try:
+        file_size = log_path.stat().st_size
+    except OSError:
+        return []
+    if file_size == 0:
+        return []
+    chunks: list[str] = []
+    tail_size = min(256 * 1024, file_size)
+    chunks.append(scan_log_chunk(log_path, file_size - tail_size, tail_size))
+    if file_size > 512 * 1024:
+        mid_start = int(file_size * 0.65)
+        mid_size = min(256 * 1024, file_size - mid_start)
+        chunks.append(scan_log_chunk(log_path, mid_start, mid_size))
+        low_start = int(file_size * 0.25)
+        low_size = min(256 * 1024, file_size - low_start)
+        chunks.append(scan_log_chunk(log_path, low_start, low_size))
+    return chunks
+
+
+def get_classification_text(log_path: Path) -> str:
+    """Return noise-filtered, lowercased text from *log_path* for error analysis.
+
+    Combines ``scan_log_tail_mid`` + ``_filter_noise`` into a single call so
+    ``classify_failure`` and ``_last_error_hash`` share the same cleaned view
+    of the log.
+    """
+    chunks = scan_log_tail_mid(log_path)
+    return "\n".join(_filter_noise(c).lower() for c in chunks)
+
+
+def _proximity_match(text: str, a: str, b: str, max_distance: int = 500) -> bool:
+    """Return True if strings a and b both appear in text within max_distance chars.
+
+    Uses re.finditer to check ALL occurrences, not just the first.  When the
+    text is built from concatenated log chunks (tail + mid), keyword "a" may
+    appear first in mid while keyword "b" appears first in tail, producing a
+    spurious large distance and a false negative.  Checking every pair of
+    positions guarantees we find the true proximity match (e.g. the single-line
+    kernel OOM message ``Out of memory: Killed process 12345``).
+    """
+    pos_a = [m.start() for m in re.finditer(re.escape(a), text)]
+    if not pos_a:
+        return False
+    pos_b = [m.start() for m in re.finditer(re.escape(b), text)]
+    if not pos_b:
+        return False
+    for pa in pos_a:
+        for pb in pos_b:
+            if abs(pb - pa) <= max_distance:
+                return True
+    return False
+
+
+def _filter_noise(text: str) -> str:
+    """Remove WARNING/INFO lines that can cause false positives in keyword matching.
+
+    Matches both plain "WARNING: ..." and torchrun-style "[rank0] WARNING: ..."
+    by looking for warning/info as the first meaningful word after any optional
+    bracket-prefixed rank tag.
+
+    Lines are NOT dropped if they also contain error-level keywords (e.g. a
+    WARNING-level CUDA OOM message), preventing false negatives.
+    """
+    lines = []
+    for line in text.splitlines():
+        lower = line.strip().lower()
+        if re.search(r'(?:\[.*?\]\s*:?\s*)?(warning|info)\b', lower):
+            if not re.search(r'\b(error|exception|traceback|fatal|critical|oom|out of memory|nan)\b', lower):
+                continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def classify_failure(log_path: Path) -> str:
     """
     Classify training failure by scanning the log for known error patterns.
@@ -169,31 +271,16 @@ def classify_failure(log_path: Path) -> str:
     1. Actual Python traceback (OOM, FileNotFound, etc.) — in the middle of the log
     2. torchrun ChildFailedError wrapper — always at the very end
 
-    We scan three regions to catch errors regardless of log size:
+    We scan three overlapping regions so errors are found regardless of
+    where they land in large files:
     - Tail (last 256 KB): covers torchrun wrapper + nearby traceback
-    - Mid section (256 KB around the 70% mark): covers early traceback in long logs
-    - Full-file keyword scan: catches OOM scattered across DDP ranks
+    - Mid section (256 KB around the 65% mark): covers early traceback
+    - Low section (256 KB around the 25% mark): covers errors in the
+      lower portion of large logs
     """
-    try:
-        with open(log_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell()
-    except (FileNotFoundError, OSError):
+    combined = get_classification_text(log_path)
+    if not combined:
         return "other"
-
-    if file_size == 0:
-        return "other"
-
-    tail_size = min(256 * 1024, file_size)
-    tail = scan_log_chunk(log_path, file_size - tail_size, tail_size).lower()
-
-    mid_text = ""
-    if file_size > 512 * 1024:
-        mid_start = int(file_size * 0.65)
-        mid_size = min(256 * 1024, file_size - mid_start)
-        mid_text = scan_log_chunk(log_path, mid_start, mid_size).lower()
-
-    combined = tail + "\n" + mid_text
 
     # Check loss_scale BEFORE oom — gradient overflow is often the root cause
     # of OOM-like symptoms, and OOM batch reduction won't fix it.
@@ -202,8 +289,9 @@ def classify_failure(log_path: Path) -> str:
     if "cuda out of memory" in combined or ("out of memory" in combined and "cuda" in combined):
         return "oom"
     # Detect system OOM-killer: kernel logs "Out of memory: Killed process" to dmesg/stderr.
-    # We require "out of memory" alongside "killed" to avoid false positives from manual SIGKILL.
-    if "killed" in combined and "out of memory" in combined:
+    # We require "out of memory" and "killed" close together (within 500 chars) to avoid
+    # false positives from unrelated occurrences scattered across different log regions.
+    if _proximity_match(combined, "killed", "out of memory", max_distance=500):
         return "oom"
     # Check NaN BEFORE assertion — NaN loss/weight is often the root cause,
     # and subsequent AssertionErrors are just symptoms. Classifying as "nan"
@@ -221,7 +309,7 @@ def classify_failure(log_path: Path) -> str:
         return "import"
     if "address already in use" in combined or "eaddrinuse" in combined:
         return "port"
-    if "nccl" in combined and ("error" in combined or "unhandled" in combined or "abort" in combined):
+    if "nccl" in combined and ("error" in combined or "unhandled" in combined or "abort" in combined or "timeout" in combined):
         return "nccl"
     if "filenotfounderror" in combined or "no such file or directory" in combined:
         return "path"
@@ -239,11 +327,3 @@ def classify_failure(log_path: Path) -> str:
 
     return "other"
 
-
-def parse_int_list(csv: str) -> list[int]:
-    out: list[int] = []
-    for raw in csv.split(","):
-        raw = raw.strip()
-        if raw:
-            out.append(int(raw))
-    return out

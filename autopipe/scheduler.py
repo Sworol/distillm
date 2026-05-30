@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import signal
 import subprocess
@@ -10,7 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from autopipe.config import default_paths
-from autopipe.io_utils import Lock, atomic_write_json, now_ts, read_json
+from autopipe.io_utils import Lock, atomic_write_json, now_ts, patch_exp, read_json
+from autopipe.recovery import recover_stale_worker
 
 
 def list_queue(queue_dir: Path) -> List[Path]:
@@ -21,28 +23,6 @@ def load_exp(path: Path) -> Dict[str, Any]:
     exp = read_json(path)
     exp.setdefault("status", "pending")
     exp.setdefault("attempt", 0)
-    return exp
-
-
-def patch_exp(path: Path, base: Dict[str, Any] | None = None, **updates: Any) -> Dict[str, Any]:
-    """
-    Patch an exp.json atomically without clobbering unrelated keys.
-
-    This reduces scheduler/worker write races by only updating specific fields.
-
-    Safety: patch_exp is only called after PID/liveness checks confirm the worker
-    is dead (Cases 1-4 in _recover_stale_worker). The worker always writes its
-    final status before exiting, so the window for a write-after-write race is
-    effectively zero. The merge_keys path (in main()) additionally guards with
-    ``status != "running"`` before touching run_exp.json.
-    """
-    if path.exists():
-        exp = read_json(path)
-    else:
-        exp = dict(base or {})
-    for k, v in updates.items():
-        exp[k] = v
-    atomic_write_json(path, exp)
     return exp
 
 
@@ -65,147 +45,198 @@ def _load_run_exp(queue_exp: Dict[str, Any], run_exp_path: Path) -> Dict[str, An
     return dict(queue_exp)
 
 
-def _recover_stale_worker(
-    run_exp_path: Path,
-    queue_exp: Dict[str, Any],
-    lock_path: Path,
-    status_path: Path,
-) -> bool:
-    """Check worker health and recover if stale.
+# Config keys that the scheduler may merge from queue definition into the
+# per-experiment working copy.  Bookkeeping fields (attempt, status,
+# updated_at, last_reason, error_hash, etc.) and train_opts are intentionally
+# excluded — the agent edits train_opts and merges would clobber those fixes.
+MERGE_KEYS = [
+    "cfg_path", "trainer", "cmd", "cmd_type", "key", "conda_env",
+    "gpus", "nproc", "master_port", "hf_endpoint",
+    "train_timeout", "hang_timeout", "vis_timeout", "vis_opts",
+    "skip_vis", "retry_sleep", "oom_batch_candidates",
+    "max_retries", "agent_cli", "hard_failure_threshold",
+]
 
-    Returns True if the worker was recovered (status updated to failed),
-    False if it appears healthy and should be counted as running.
+
+def _phase1_stale_recovery(paths, q: List[Path]) -> int:
+    """Recover stale workers and return count of healthy 'running' experiments.
+
+    For each experiment in *q*:
+    - Clean orphaned ``.lock_worker`` files for non-"running" statuses.
+    - Delegate ``recover_stale_worker`` for experiments marked "running".
+    - Count experiments that appear to have a healthy worker.
     """
-    # Pre-read current bookkeeping fields so stale recovery can increment them
-    # for proper exponential backoff in the scheduler retry loop.
-    curr_consecutive = 0
-    curr_attempt = 0
-    if run_exp_path.exists():
-        try:
-            curr = read_json(run_exp_path)
-            curr_consecutive = int(curr.get("consecutive_failures", 0))
-            curr_attempt = int(curr.get("attempt", 0))
-        except Exception:
-            pass
-    next_consecutive = curr_consecutive + 1
-    last_failed_ts = str(time.time())
+    running = 0
+    for exp_path in q:
+        queue_exp = load_exp(exp_path)
+        run_root = paths.runs_dir / queue_exp["exp_id"]
+        run_exp_path = run_root / "exp.json"
+        exp = _load_run_exp(queue_exp, run_exp_path)
 
-    # Case 1: status.json exists with a terminal status — sync exp.json + clean lock.
-    try:
-        st = read_json(status_path)
-        st_status = st.get("status")
-        if st_status in {"failed", "success", "hard_failure"}:
-            patch_kwargs: Dict[str, Any] = dict(
-                status=st_status,
-                attempt=st.get("attempt", 0),
-                updated_at=now_ts(),
-                last_exit_code=st.get("exit_code"),
-                last_reason=st.get("reason"),
-            )
-            if st_status == "success":
-                patch_kwargs["consecutive_failures"] = 0
-            elif st_status in {"failed", "hard_failure"}:
-                patch_kwargs["last_failed_at"] = last_failed_ts
-            patch_exp(run_exp_path, base=queue_exp, **patch_kwargs)
-            if lock_path.exists():
-                pid = Lock._read_lock_pid(lock_path)
-                if pid is None or not Lock._pid_alive(pid):
-                    try:
-                        lock_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            return True
-        # Case 2: status.json says "running" but worker lock is missing → stale.
-        if st_status == "running" and not lock_path.exists():
-            patch_exp(
-                run_exp_path,
-                base=queue_exp,
-                status="failed",
-                updated_at=now_ts(),
-                last_reason="stale_worker",
-                consecutive_failures=next_consecutive,
-                last_failed_at=last_failed_ts,
-            )
-            atomic_write_json(
-                status_path,
-                {
-                    "status": "failed",
-                    "updated_at": now_ts(),
-                    "attempt": st.get("attempt", 0),
-                    "exit_code": 1,
-                    "reason": "stale_worker",
-                },
-            )
-            return True
-    except FileNotFoundError:
-        pass
+        # Clean orphaned worker locks for non-"running" statuses.
+        # For "running" statuses _recover_stale_worker handles this
+        # internally so there is no ordering dependency between the
+        # two steps.
+        worker_lock_path = run_root / ".lock_worker"
+        if exp.get("status") != "running" and worker_lock_path.exists():
+            pid = Lock._read_lock_pid(worker_lock_path)
+            if pid is not None and not Lock._pid_alive(pid):
+                try:
+                    worker_lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-    # Case 3: No status.json (or could not be read) and no lock after grace period.
-    if not lock_path.exists():
-        try:
-            age = time.time() - status_path.stat().st_mtime
-        except FileNotFoundError:
-            # status_path doesn't exist; fall back to run_exp.json mtime.
-            # If exp was set to "running" >120s ago with no status or lock file,
-            # the worker died before creating any artifacts.
-            if run_exp_path.exists():
-                age = time.time() - run_exp_path.stat().st_mtime
+        if exp.get("status") != "running":
+            continue
+
+        status_path = run_root / "status.json"
+        if recover_stale_worker(run_exp_path, queue_exp, worker_lock_path, status_path):
+            continue
+
+        running += 1
+    return running
+
+
+def _phase2_spawn_workers(
+    paths,
+    q: List[Path],
+    repo_root: Path,
+    running: int,
+    _workers: Dict[str, subprocess.Popen],
+    max_parallel: int,
+) -> int:
+    """Try to spawn workers for pending/failed/aborted experiments.
+
+    Returns the updated *running* count (may be higher if new workers were
+    successfully spawned).  Modifies ``_workers`` in-place.
+    """
+    for exp_path in q:
+        queue_exp = load_exp(exp_path)
+        run_root = paths.runs_dir / queue_exp["exp_id"]
+        run_exp_path = run_root / "exp.json"
+        exp = _load_run_exp(queue_exp, run_exp_path)
+        status = exp.get("status")
+
+        if status in {"success", "hard_failure"}:
+            continue
+        if status == "running":
+            continue  # Already counted in phase 1.
+
+        # Avoid spawning a duplicate worker when one was already
+        # launched in a previous iteration but hasn't updated
+        # exp.json to "running" yet (async startup).
+        if queue_exp.get("exp_id") in _workers:
+            running += 1
+            continue
+
+        if running >= max_parallel:
+            break
+
+        # ---- Retry policy ------------------------------------------------
+        attempt = int(exp.get("attempt", 0))
+        max_retries = int(exp.get("max_retries", 2))
+
+        if status == "failed":
+            # Exponential backoff: skip if still in cooldown period.
+            retry_sleep_base = int(exp.get("retry_sleep", 60))
+            consecutive_failures = int(exp.get("consecutive_failures", 0))
+            retry_sleep = min(retry_sleep_base * (2 ** consecutive_failures), 900)
+            last_failed = exp.get("last_failed_at", "")
+            if last_failed:
+                try:
+                    elapsed = time.time() - float(last_failed)
+                    if elapsed < retry_sleep:
+                        continue  # cooling down
+                except Exception:
+                    pass
+
+            if attempt > max_retries:
+                patch_exp(run_exp_path, base=queue_exp, status="aborted", updated_at=now_ts())
+                continue
+
+        if status == "aborted":
+            # Only auto-retry an aborted experiment if the queue config
+            # has been modified since the run config was last written
+            # (e.g., a hotfix).
+            qmtime = exp_path.stat().st_mtime if exp_path.exists() else 0
+            rmtime = run_exp_path.stat().st_mtime if run_exp_path.exists() else 0
+            if qmtime > rmtime:
+                patch_exp(run_exp_path, base=queue_exp,
+                          attempt=0, consecutive_failures=0,
+                          last_failed_at="",
+                          status="failed", updated_at=now_ts())
+                status = "failed"
             else:
-                age = 0
-        if age > 120:
-            stale_attempt = max(curr_attempt, 1)  # preserve attempt counter, floor at 1
-            patch_exp(
-                run_exp_path,
-                base=queue_exp,
-                status="failed",
-                updated_at=now_ts(),
-                last_reason="stale_worker",
-                consecutive_failures=next_consecutive,
-                last_failed_at=last_failed_ts,
-            )
-            atomic_write_json(
-                status_path,
-                {
-                    "status": "failed",
-                    "updated_at": now_ts(),
-                    "attempt": stale_attempt,
-                    "exit_code": 1,
-                    "reason": "stale_worker",
-                },
-            )
-            return True
+                continue  # no changes detected, keep aborted
 
-    # Case 4: Lock exists but recorded PID is dead → clean lock + mark stale.
-    pid = Lock._read_lock_pid(lock_path)
-    if pid is not None and not Lock._pid_alive(pid):
+        # ---- Sync per-exp working config --------------------------------
+        if not run_exp_path.exists():
+            run_root.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(run_exp_path, exp)
+        else:
+            try:
+                cur = read_json(run_exp_path)
+            except Exception:
+                cur = exp
+            changed = False
+            for k in MERGE_KEYS:
+                if k in queue_exp and cur.get(k) != queue_exp.get(k):
+                    cur[k] = queue_exp.get(k)
+                    changed = True
+            if changed:
+                atomic_write_json(run_exp_path, cur)
+
+        # ---- Spawn worker -----------------------------------------------
+        # NOTE: The worker sets its own status to "running" after acquiring
+        # the worker lock. We do NOT set it here — if the worker fails to
+        # start (lock busy), exp.json would incorrectly remain "running"
+        # and block future retries.
+        cmd = [
+            sys.executable, "-m", "autopipe.worker",
+            "--repo-root", str(repo_root),
+            "--exp-json", str(exp_path),
+            "--agent-timeout", "600",
+        ]
+        env = os.environ.copy()
+        ctx_conda = queue_exp.get("conda_env") or exp.get("conda_env")
+        if ctx_conda:
+            cmd = ["conda", "run", "-n", str(ctx_conda), "python", "-m", "autopipe.worker"] + cmd[3:]
+        log_path = paths.logs_dir / f"scheduler_{exp['exp_id']}.log"
+        with open(log_path, "ab", buffering=0) as f:
+            f.write(f"\n==== {now_ts()} START {' '.join(cmd)}\n".encode())
+            f.flush()
+            proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=str(repo_root), env=env)
+            _workers[exp["exp_id"]] = proc
+        running += 1
+
+    return running
+
+
+def _reap_workers(_workers: Dict[str, subprocess.Popen]) -> None:
+    """Remove finished workers from the tracking dict."""
+    stale = [eid for eid, p in _workers.items() if p.poll() is not None]
+    for eid in stale:
+        del _workers[eid]
+
+
+def _kill_workers_signaller(
+    _workers: Dict[str, subprocess.Popen], signum: int | None = None, frame: Any = None
+) -> None:
+    """Best-effort terminate all tracked workers on scheduler shutdown."""
+    for eid, proc in list(_workers.items()):
         try:
-            lock_path.unlink(missing_ok=True)
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except Exception:
             pass
-        stale_attempt = max(curr_attempt, 1)  # preserve attempt counter, floor at 1
-        patch_exp(
-            run_exp_path,
-            base=queue_exp,
-            status="failed",
-            updated_at=now_ts(),
-            last_reason="stale_worker",
-            consecutive_failures=next_consecutive,
-            last_failed_at=last_failed_ts,
-        )
-        atomic_write_json(
-            status_path,
-            {
-                "status": "failed",
-                "updated_at": now_ts(),
-                "attempt": stale_attempt,
-                "exit_code": 1,
-                "reason": "stale_worker",
-            },
-        )
-        return True
-
-    # Worker appears healthy.
-    return False
+    time.sleep(3)
+    for eid, proc in list(_workers.items()):
+        try:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+    sys.exit(128 + (signum if signum else signal.SIGTERM))
 
 
 def main():
@@ -215,13 +246,11 @@ def main():
     ap.add_argument("--max-parallel", type=int, default=1, help="Keep 1 for single-node multi-GPU training.")
     ap.add_argument("--once", action="store_true", help="Run a single scan iteration and exit.")
     ap.add_argument(
-        "--no-spawn",
-        action="store_true",
+        "--no-spawn", action="store_true",
         help="Do not start new workers (repair/refresh statuses only).",
     )
     ap.add_argument(
-        "--force-steal-lock",
-        action="store_true",
+        "--force-steal-lock", action="store_true",
         help="If `.lock_scheduler` exists but the recorded PID is dead, remove it and start.",
     )
     args = ap.parse_args()
@@ -252,200 +281,28 @@ def main():
             print("[scheduler] already running", file=sys.stderr)
             sys.exit(2)
 
+    # Track spawned worker processes so we can terminate them on shutdown
+    # and avoid leaving orphaned GPU processes if the scheduler is killed.
+    _workers: Dict[str, subprocess.Popen] = {}
+    _close_workers = functools.partial(_kill_workers_signaller, _workers)
+    signal.signal(signal.SIGTERM, _close_workers)
+    signal.signal(signal.SIGINT, _close_workers)
+
     try:
-        # Track spawned worker processes so we can terminate them on shutdown
-        # and avoid leaving orphaned GPU processes if the scheduler is killed.
-        _workers: Dict[str, subprocess.Popen] = {}
-
-        def _reap_workers() -> None:
-            """Remove finished workers from the tracking dict."""
-            stale = [eid for eid, p in _workers.items() if p.poll() is not None]
-            for eid in stale:
-                del _workers[eid]
-
-        def _kill_workers(signum: int | None = None, frame: Any = None) -> None:
-            """Best-effort terminate all tracked workers on scheduler shutdown."""
-            for eid, proc in list(_workers.items()):
-                try:
-                    if proc.poll() is None:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except Exception:
-                    pass
-            # Give them a moment, then SIGKILL.
-            time.sleep(3)
-            for eid, proc in list(_workers.items()):
-                try:
-                    if proc.poll() is None:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except Exception:
-                    pass
-            sys.exit(0)
-
-        signal.signal(signal.SIGTERM, _kill_workers)
-        signal.signal(signal.SIGINT, _kill_workers)
-
         while True:
-            # Health check: if another scheduler stole our lock, exit immediately
             if not sched_lock.owned():
                 print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
                 sys.exit(2)
             sched_lock.heartbeat()
-
-            # Drop finished workers from the tracking dict to avoid unbounded growth.
-            _reap_workers()
+            _reap_workers(_workers)
 
             q = list_queue(paths.queue_dir)
-            # Phase 1: refresh statuses / recover stale running workers.
-            running = 0
-            for exp_path in q:
-                queue_exp = load_exp(exp_path)
-                run_root = paths.runs_dir / queue_exp["exp_id"]
-                run_exp_path = run_root / "exp.json"
-                exp = _load_run_exp(queue_exp, run_exp_path)
-
-                if exp.get("status") != "running":
-                    continue
-
-                status_path = run_root / "status.json"
-                worker_lock_path = run_root / ".lock_worker"
-                if _recover_stale_worker(run_exp_path, queue_exp, worker_lock_path, status_path):
-                    continue
-
-                running += 1
+            running = _phase1_stale_recovery(paths, q)
 
             if not args.no_spawn:
-                for exp_path in q:
-                    queue_exp = load_exp(exp_path)
-                    run_root = paths.runs_dir / queue_exp["exp_id"]
-                    run_exp_path = run_root / "exp.json"
-                    exp = _load_run_exp(queue_exp, run_exp_path)
-                    status = exp.get("status")
-                    if status in {"success", "hard_failure"}:
-                        continue
-                    if status == "running":
-                        # Already counted in phase 1.
-                        continue
-
-                    if running >= args.max_parallel:
-                        break
-
-                    # Start or retry
-                    attempt = int(exp.get("attempt", 0))
-                    max_retries = int(exp.get("max_retries", 2))
-
-                    if status == "failed":
-                        # Exponential backoff: skip if still in cooldown period.
-                        retry_sleep_base = int(exp.get("retry_sleep", 60))
-                        consecutive_failures = int(exp.get("consecutive_failures", 0))
-                        retry_sleep = min(retry_sleep_base * (2 ** consecutive_failures), 900)  # max 15min
-                        last_failed = exp.get("last_failed_at", "")
-                        if last_failed:
-                            try:
-                                elapsed = time.time() - float(last_failed)
-                                if elapsed < retry_sleep:
-                                    continue  # cooling down
-                            except Exception:
-                                pass
-
-                        if attempt > max_retries:
-                            patch_exp(run_exp_path, base=queue_exp, status="aborted", updated_at=now_ts())
-                            continue
-                    if status == "aborted":
-                        # Only auto-retry an aborted experiment if the underlying config has been
-                        # modified (e.g., a hotfix). Otherwise, require manual intervention.
-                        qmtime = exp_path.stat().st_mtime if exp_path.exists() else 0
-                        rmtime = run_exp_path.stat().st_mtime if run_exp_path.exists() else 0
-                        if qmtime > rmtime:
-                            # Queue config was updated — retry is likely intentional.
-                            # Persist the reset to run_exp.json so the worker and status
-                            # inspection tools see a consistent state.
-                            attempt = 0
-                            patch_exp(run_exp_path, base=queue_exp,
-                                      attempt=0, consecutive_failures=0,
-                                      status="failed", updated_at=now_ts())
-                            status = "failed"
-                        else:
-                            continue  # no changes detected, keep aborted
-
-                    # Ensure per-exp working config exists.
-                    if not run_exp_path.exists():
-                        run_root.mkdir(parents=True, exist_ok=True)
-                        atomic_write_json(run_exp_path, exp)
-                    else:
-                        # Keep per-exp working config fresh with queue updates.
-                        # This is important when we hotfix queue configs (e.g., add master_port
-                        # or offline pretrained paths) and want retries to pick them up.
-                        #
-                        # We intentionally only merge known config keys to avoid clobbering
-                        # worker/agent-written bookkeeping fields like `attempt`, `status`,
-                        # `updated_at`, `last_reason`, etc.
-                        try:
-                            cur = read_json(run_exp_path)
-                        except Exception:
-                            cur = exp
-                        merge_keys = [
-                            "cfg_path",
-                            "trainer",
-                            "cmd",
-                            "cmd_type",
-                            "key",
-                            "conda_env",
-                            "gpus",
-                            "nproc",
-                            "master_port",
-                            "hf_endpoint",
-                            "train_timeout",
-                            "vis_timeout",
-                            "vis_opts",
-                            "skip_vis",
-                            "retry_sleep",
-                            "oom_batch_candidates",
-                            "max_retries",
-                            "agent_cli",
-                            "hard_failure_threshold",
-                        ]
-                        # Note: train_opts is intentionally NOT in merge_keys.
-                        # The agent edits train_opts to fix training failures, and
-                        # scheduler merges would clobber those fixes with queue defaults.
-                        changed = False
-                        for k in merge_keys:
-                            if k in queue_exp and cur.get(k) != queue_exp.get(k):
-                                cur[k] = queue_exp.get(k)
-                                changed = True
-                        if changed:
-                            atomic_write_json(run_exp_path, cur)
-
-                    # NOTE: The worker sets its own status to "running" after acquiring
-                    # the worker lock. We do NOT set it here because if the worker fails
-                    # to start (lock busy), exp.json would incorrectly remain "running"
-                    # and block future retries.
-
-                    cmd = [
-                        sys.executable,
-                        "-m",
-                        "autopipe.worker",
-                        "--repo-root",
-                        str(repo_root),
-                        "--exp-json",
-                        str(exp_path),
-                        "--agent-timeout",
-                        "600",
-                    ]
-                    env = os.environ.copy()
-                    # If conda environment is specified in the queue JSON, run the worker under it.
-                    # Important: call `python` (resolved inside the env), not an absolute python path.
-                    # This avoids import mismatches (e.g. tensorboardX missing) and ensures the
-                    # repo root is on sys.path via cwd=repo_root.
-                    conda_env = queue_exp.get("conda_env") or exp.get("conda_env")
-                    if conda_env:
-                        cmd = ["conda", "run", "-n", str(conda_env), "python", "-m", "autopipe.worker"] + cmd[3:]
-                    log_path = paths.logs_dir / f"scheduler_{exp['exp_id']}.log"
-                    with open(log_path, "ab", buffering=0) as f:
-                        f.write(f"\n==== {now_ts()} START {' '.join(cmd)}\n".encode())
-                        f.flush()
-                        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=str(repo_root), env=env)
-                        _workers[exp["exp_id"]] = proc
-                    running += 1
+                running = _phase2_spawn_workers(
+                    paths, q, repo_root, running, _workers, args.max_parallel,
+                )
 
             if args.once:
                 break

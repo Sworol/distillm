@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from autopipe.io_utils import now_ts
 
 
-def git_diff(repo_root: Path) -> str:
+def git_diff(repo_root: Path, max_bytes: int = 2 * 1024 * 1024) -> str:
+    """Return git diff output, truncated to max_bytes to avoid OOM on large diffs."""
     try:
         out = subprocess.check_output(["git", "diff"], cwd=str(repo_root))
-        return out.decode("utf-8", errors="replace")
+        text = out.decode("utf-8", errors="replace")
+        if len(text) > max_bytes:
+            text = text[:max_bytes] + "\n... [truncated]\n"
+        return text
     except Exception as exc:
         return f"[git_diff_error] {repr(exc)}\n"
 

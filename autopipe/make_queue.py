@@ -6,14 +6,20 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
-from autopipe.config import default_paths
+from autopipe.config import HARD_FAILURE_THRESHOLD, default_paths
 from autopipe.io_utils import atomic_write_json, now_ts
 
 
-def distillm_specs() -> List[Dict[str, Any]]:
-    """Defines all DistiLLM baseline experiments in execution order."""
+def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
+    """Defines all DistiLLM baseline experiments in execution order.
 
-    BASE = str(Path(__file__).resolve().parent.parent)
+    Args:
+        base: Repo root path. If None, inferred from this file's location.
+    """
+
+    if base is None:
+        base = str(Path(__file__).resolve().parent.parent)
+    BASE = base
     specs: List[Dict[str, Any]] = []
 
     # ============================================================
@@ -123,6 +129,14 @@ def distillm_specs() -> List[Dict[str, Any]]:
     return specs
 
 
+def _extract_script_path(exp: Dict[str, Any]) -> Path | None:
+    """Return the Path to the bash script referenced by *exp*, or None."""
+    if exp.get("cmd_type") != "bash":
+        return None
+    parts = exp["cmd"].split()
+    return Path(parts[0]) if parts else Path(exp["cmd"])
+
+
 def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
     exp_id = f"{spec['key']}_{uuid.uuid4().hex[:8]}"
     return {
@@ -140,33 +154,55 @@ def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
         "train_timeout": spec.get("train_timeout", 86400),
         "skip_vis": spec.get("skip_vis", True),
         "conda_env": spec.get("conda_env", "llm_train"),
-        "hard_failure_threshold": spec.get("hard_failure_threshold", 3),
+        "hard_failure_threshold": spec.get("hard_failure_threshold", HARD_FAILURE_THRESHOLD),
         "train_opts": spec.get("train_opts", {}),  # hyperparams that agent can edit
         "oom_batch_candidates": spec.get("oom_batch_candidates", []),  # batch sizes to try on OOM
+        "max_oom_retries": spec.get("max_oom_retries", len(spec.get("oom_batch_candidates", []))),
     }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-root", default=".", help="Path to repo root (default: .)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Validate script paths only; do not generate queue files.")
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
     paths = default_paths(repo_root)
-    paths.queue_dir.mkdir(parents=True, exist_ok=True)
 
-    specs = distillm_specs()
+    specs = distillm_specs(base=str(repo_root))
+    errors = 0
     for i, spec in enumerate(specs):
         exp = build_exp(spec, seq=i + 1)
-        # Validate that bash scripts referenced in the queue entry exist on disk.
-        if exp.get("cmd_type") == "bash":
-            script_path = Path(exp["cmd"].split()[0] if exp["cmd"].split() else exp["cmd"])
-            if not script_path.exists():
-                print(f"WARNING: [{spec['key']}] script not found: {script_path}", file=sys.stderr)
-        # Zero-padded numeric prefix enforces execution order in glob sort
+        script_path = _extract_script_path(exp)
+        if script_path is not None and not script_path.exists():
+            print(f"ERROR: [{spec['key']}] script not found: {script_path}", file=sys.stderr)
+            errors += 1
+        elif args.dry_run:
+            print(f"OK: [{spec['key']}] {exp['seq']:02d} {script_path or '(no script)'}")
+
+    if args.dry_run:
+        if errors:
+            print(f"\nDry run: {errors} error(s) found.", file=sys.stderr)
+            sys.exit(1)
+        print(f"\nDry run: all {len(specs)} experiment(s) validated.")
+        return
+
+    paths.queue_dir.mkdir(parents=True, exist_ok=True)
+    for i, spec in enumerate(specs):
+        exp = build_exp(spec, seq=i + 1)
+        script_path = _extract_script_path(exp)
+        if script_path is not None and not script_path.exists():
+            print(f"ERROR: [{spec['key']}] script not found: {script_path} — skipping", file=sys.stderr)
+            errors += 1
+            continue
         out = paths.queue_dir / f"{exp['seq']:02d}_{exp['exp_id']}.json"
         atomic_write_json(out, exp)
         print(f"[{spec['key']}] {out}")
+
+    if errors:
+        print(f"\n{errors} error(s) — queue generated but {errors} experiment(s) skipped.", file=sys.stderr)
 
 
 if __name__ == "__main__":
