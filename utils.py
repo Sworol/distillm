@@ -119,7 +119,22 @@ def initialize(args):
 # Load and save model
 def get_model(args, device):
     config = AutoConfig.from_pretrained(args.model_path)
-    
+
+    # Resolve load path: if --load is given, find the latest step checkpoint inside it.
+    model_load_path = args.model_path
+    if args.load is not None and os.path.isdir(args.load):
+        step_dirs = []
+        for name in os.listdir(args.load):
+            subdir = os.path.join(args.load, name)
+            if os.path.isdir(subdir) and name.isdigit():
+                bin_file = os.path.join(subdir, "pytorch_model.bin")
+                if os.path.isfile(bin_file) and os.path.getsize(bin_file) > 100_000_000:
+                    step_dirs.append((int(name), subdir))
+        if step_dirs:
+            step_dirs.sort(key=lambda x: x[0], reverse=True)
+            model_load_path = step_dirs[0][1]
+            print_rank(f"[load] Resuming from checkpoint: {model_load_path}")
+
     st_time = time.time()
     if args.model_parallel:
         raise NotImplementedError
@@ -127,9 +142,9 @@ def get_model(args, device):
         config.is_model_parallel = False
         dtype = torch.float32 if args.fp32 else torch.float16
         try:
-            model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=dtype)
+            model = AutoModelForCausalLM.from_pretrained(model_load_path, config=config, device_map={"": device}, torch_dtype=dtype)
         except:
-            model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=torch.float32)
+            model = AutoModelForCausalLM.from_pretrained(model_load_path, config=config, device_map={"": device}, torch_dtype=torch.float32)
             model = model.half()
         
         if args.peft is not None:

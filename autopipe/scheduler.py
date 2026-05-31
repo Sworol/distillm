@@ -93,7 +93,9 @@ def _phase1_stale_recovery(paths: "Paths", q: List[Path]) -> int:
         worker_lock_path = run_root / ".lock_worker"
         if exp.get("status") != "running" and worker_lock_path.exists():
             pid = Lock._read_lock_pid(worker_lock_path)
-            if pid is not None and not Lock._pid_alive(pid):
+            # Clean up if: (1) lock has no valid PID (empty/corrupt), or
+            # (2) the PID it references is no longer alive.
+            if pid is None or not Lock._pid_alive(pid):
                 try:
                     worker_lock_path.unlink(missing_ok=True)
                 except Exception:

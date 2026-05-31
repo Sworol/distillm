@@ -227,6 +227,11 @@ def _prepare_environment(
     for k, v in exp.get("train_opts", {}).items():
         env[f"TRAIN_{k.upper()}"] = str(v)
 
+    # Special: load_path → AUTOPIPE_LOAD_PATH for script --load checkpoint resume.
+    load_path = exp.get("train_opts", {}).get("load_path")
+    if load_path:
+        env["AUTOPIPE_LOAD_PATH"] = str(load_path)
+
     # Build training command.
     cmd_type = exp.get("cmd_type", "torchrun")
     nproc = int(exp.get("nproc", 4))
