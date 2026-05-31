@@ -89,6 +89,9 @@ OPTS+=" --top-k 0"
 OPTS+=" --top-p 1.0"
 OPTS+=" --temperature 1.0"
 
+if [ -n "${AUTOPIPE_LOAD_PATH:-}" ]; then
+    OPTS+=" --load ${AUTOPIPE_LOAD_PATH}"
+fi
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True

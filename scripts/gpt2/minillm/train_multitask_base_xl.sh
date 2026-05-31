@@ -91,6 +91,11 @@ OPTS+=" --temperature 1.0"
 OPTS+=" --deepspeed"
 OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config.json"
 
+# checkpoint resume
+if [ -n "${AUTOPIPE_LOAD_PATH:-}" ]; then
+    OPTS+=" --load ${AUTOPIPE_LOAD_PATH}"
+fi
+
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
 export TF_CPP_MIN_LOG_LEVEL=3

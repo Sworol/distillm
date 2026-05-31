@@ -4,6 +4,7 @@ import argparse
 import enum
 import hashlib
 import os
+import re
 import shutil
 import shlex
 import socket
@@ -164,6 +165,82 @@ def run_cmd(
             _current_subprocess = None
 
 
+def _find_latest_checkpoint(script_text: str, repo_root: Path) -> str | None:
+    """Find the latest valid DeepSpeed checkpoint for a training script.
+
+    Parses ``--save`` from the script, expands known shell variables,
+    and returns the path to the most recent DeepSpeed checkpoint directory
+    (the hp-suffixed parent directory, e.g. ``.../e20-bs2-.../``), or
+    None if no valid checkpoint exists.
+    """
+    base = str(repo_root)
+    # Extract --save argument from the script text.
+    save_arg = None
+    for line in script_text.splitlines():
+        m = re.search(r'--save\s+(\S+)', line)
+        if m:
+            save_arg = m.group(1)
+            break
+    if not save_arg:
+        return None
+
+    # Expand known shell variables that scripts use for the save path.
+    # SAVE_PATH is often set earlier in the script; try to resolve it.
+    save_var = None
+    for line in script_text.splitlines():
+        m = re.match(r'SAVE_PATH="([^"]+)"', line.strip())
+        if m:
+            save_var = m.group(1)
+            break
+    save_arg = save_arg.replace('${SAVE_PATH}', save_var or '')
+    save_arg = save_arg.replace('${BASE_PATH}', base)
+    # Strip shell quoting artifacts (trailing quotes, leading quotes)
+    save_arg = save_arg.strip('\'"')
+
+    save_dir = Path(save_arg)
+    # Collect directories that may contain DeepSpeed checkpoint step dirs.
+    # DeepSpeed auto-appends the hp suffix (e20-bs2-...), so we scan both
+    # the save base and one level below.
+    search_dirs: List[Path] = []
+    _has_numeric_subdir = lambda d: any(
+        sub.is_dir() and sub.name.isdigit() for sub in d.iterdir()
+    )
+    if save_dir.is_dir():
+        if _has_numeric_subdir(save_dir):
+            search_dirs.append(save_dir)
+        for child in save_dir.iterdir():
+            if child.is_dir() and _has_numeric_subdir(child):
+                search_dirs.append(child)
+    else:
+        parent = save_dir.parent
+        if parent.exists():
+            search_dirs.extend(
+                d for d in parent.iterdir()
+                if d.is_dir() and 'e' in d.name[:2] and _has_numeric_subdir(d)
+            )
+
+    best = None
+    best_ts = 0.0
+    for target in search_dirs:
+        ckpt_dirs = [d for d in target.iterdir() if d.is_dir() and d.name.isdigit()]
+        if not ckpt_dirs:
+            continue
+        valid = any(
+            list(cd.glob("zero_to_fp32.py")) or list(cd.glob("*.pt"))
+            or list(cd.glob("pytorch_model.bin")) or list(cd.glob("*.safetensors"))
+            or (cd / "latest").exists()
+            for cd in ckpt_dirs
+        )
+        if not valid:
+            continue
+        mtime = target.stat().st_mtime
+        if mtime > best_ts:
+            best_ts = mtime
+            best = str(target)
+
+    return best
+
+
 def _prepare_environment(
     exp: Dict[str, Any],
     repo_root: Path,
@@ -205,6 +282,16 @@ def _prepare_environment(
     master_port = resolve_master_port(exp) if cmd_type != "bash" else 0
     if cmd_type == "bash":
         train_cmd = ["bash"] + shlex.split(exp["cmd"])
+        # Detect DeepSpeed checkpoint for resume.
+        script_path = Path(shlex.split(exp["cmd"])[0])
+        if script_path.exists():
+            try:
+                script_text = script_path.read_text(encoding="utf-8")
+                ckpt_load = _find_latest_checkpoint(script_text, repo_root)
+                if ckpt_load:
+                    env["AUTOPIPE_LOAD_PATH"] = ckpt_load
+            except Exception:
+                pass
     else:
         train_cmd = [
             sys.executable,

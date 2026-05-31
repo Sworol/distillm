@@ -87,6 +87,7 @@ ${TORCHRUN} ${DISTRIBUTED_ARGS} "${BASE_PATH}/finetune.py" \
     --do-sample \
     --top-k 0 \
     --top-p 1.0 \
-    --temperature 1.0
+    --temperature 1.0 \
+    ${AUTOPIPE_LOAD_PATH:+--load "${AUTOPIPE_LOAD_PATH}"}
 
 echo "KD multi-task training done."
