@@ -14,8 +14,11 @@ from rich.table import Table
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
-    GenerationConfig,
-    mpu)
+    GenerationConfig)
+try:
+    from transformers import mpu
+except ImportError:
+    mpu = None
 
 from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 

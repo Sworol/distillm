@@ -23,7 +23,7 @@ CKPT="${BASE_PATH}/checkpoints/gpt2-base/"
 TEACHER_CKPT_NAME="xlarge-sft-multitask"
 TEACHER_CKPT="${BASE_PATH}/results/gpt2/train/sft_multitask/e10-bs4-lr5e-05-G1-N4-NN1/37220"
 # data (pseudo-labeled data from SeqKD generation, needs tokenization)
-DATA_DIR="${BASE_PATH}/processed_data/combined/pseudo/sft_multitask/"
+DATA_DIR="${BASE_PATH}/processed_data/combined/pseudo/sft_multitask/gpt2/"
 LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/10M/"
 # hp (env vars override defaults — autopipe agent edits exp.json → worker exports TRAIN_*)
 BATCH_SIZE=${TRAIN_BATCH_SIZE:-2}

@@ -5,9 +5,18 @@ set -euo pipefail
 BASE_PATH="/home/ufile/group_3/zjx/distillm"
 SAVE="${BASE_PATH}/results/gpt2/eval_main/"
 
-# Auto-detect SeqKD checkpoint
+# Auto-detect SeqKD checkpoint (pick latest step dir with config.json)
 SEQKD_RUN_DIR="${BASE_PATH}/results/gpt2/train/seqkd_multitask/base_xlarge"
-CKPT_DIR=$(ls -dt ${SEQKD_RUN_DIR}/*/*/ 2>/dev/null | head -1)
+CKPT_DIR=""
+for d in $(ls -dt ${SEQKD_RUN_DIR}/*/*/ 2>/dev/null); do
+    [ -z "${d%/}" ] && continue
+    dirname=$(basename "$d")
+    [ "${dirname%/}" = "eval" ] && continue
+    if [ -f "${d%/}/config.json" ]; then
+        CKPT_DIR="$d"
+        break
+    fi
+done
 if [ -z "${CKPT_DIR}" ]; then
     echo "ERROR: No SeqKD checkpoint found in ${SEQKD_RUN_DIR}"
     exit 1

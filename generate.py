@@ -10,7 +10,10 @@ import numpy as np
 import json
 from tqdm import tqdm
 
-from transformers import mpu
+try:
+    from transformers import mpu
+except ImportError:
+    mpu = None
 
 from arguments import get_args
 

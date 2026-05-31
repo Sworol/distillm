@@ -1,8 +1,11 @@
 import torch
 from transformers import (
     AutoModelForCausalLM,
-    AutoTokenizer,
-    mpu)
+    AutoTokenizer)
+try:
+    from transformers import mpu
+except ImportError:
+    mpu = None
 
 
 class Reward():

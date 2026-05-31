@@ -16,7 +16,9 @@ mkdir -p "${OUT_DIR}"
 python3 "${BASE_PATH}/tools/process_data_dolly.py" \
     --data-dir "${GEN_DIR}" \
     --processed-data-dir "${OUT_DIR}" \
-    --model-path "${BASE_PATH}/checkpoints/gpt2-base"
+    --model-path "${BASE_PATH}/checkpoints/gpt2-base" \
+    --data-process-workers 32 \
+    --dev-num 3000
 
 echo "SeqKD tokenization done."
 ls -lh "${OUT_DIR}"

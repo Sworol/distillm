@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import functools
 import os
 import signal
@@ -8,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from autopipe.config import default_paths
 from autopipe.io_utils import Lock, atomic_write_json, now_ts, patch_exp, read_json
@@ -219,6 +220,45 @@ def _reap_workers(_workers: Dict[str, subprocess.Popen]) -> None:
         del _workers[eid]
 
 
+def _parse_time_window(window_str: str) -> Tuple[int, int] | None:
+    """Parse HH:MM-HH:MM into (start_minutes, end_minutes) or None.
+
+    Example: "22:00-08:00" -> (1320, 480) (overnight window).
+    """
+    try:
+        start_str, end_str = window_str.split("-")
+        start_min = int(start_str[:2]) * 60 + int(start_str[3:5])
+        end_min = int(end_str[:2]) * 60 + int(end_str[3:5])
+        if start_min == end_min:
+            return None
+        return start_min, end_min
+    except Exception:
+        return None
+
+
+def _in_active_window(window: Tuple[int, int] | None) -> bool:
+    """Return True if the current local time falls within *window*. Handles overnight spans."""
+    if window is None:
+        return True
+    start, end = window
+    now = datetime.datetime.now()
+    now_min = now.hour * 60 + now.minute
+    if start <= end:
+        return start <= now_min < end
+    else:
+        return now_min >= start or now_min < end
+
+
+def _terminate_workers(_workers: Dict[str, subprocess.Popen]) -> None:
+    """SIGTERM all running workers for graceful checkpoint-and-exit."""
+    for eid, proc in list(_workers.items()):
+        try:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+
 def _kill_workers_signaller(
     _workers: Dict[str, subprocess.Popen], signum: int | None = None, frame: Any = None
 ) -> None:
@@ -253,7 +293,17 @@ def main():
         "--force-steal-lock", action="store_true",
         help="If `.lock_scheduler` exists but the recorded PID is dead, remove it and start.",
     )
+    ap.add_argument(
+        "--active-window", default="",
+        help="Time window for training, e.g. '22:00-08:00' (overnight). Empty = always active.",
+    )
+    ap.add_argument(
+        "--window-kill", action="store_true",
+        help="SIGTERM running workers when the active window ends.",
+    )
     args = ap.parse_args()
+
+    time_window = _parse_time_window(args.active_window) if args.active_window else None
 
     repo_root = Path(args.repo_root).resolve()
     paths = default_paths(repo_root)
@@ -288,24 +338,78 @@ def main():
     signal.signal(signal.SIGTERM, _close_workers)
     signal.signal(signal.SIGINT, _close_workers)
 
+    _was_active = True
+    _tick = 0
+    _disk_warned = False
     try:
         while True:
-            if not sched_lock.owned():
-                print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
-                sys.exit(2)
-            sched_lock.heartbeat()
-            _reap_workers(_workers)
+            try:
+                if not sched_lock.owned():
+                    print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
+                    sys.exit(2)
+                sched_lock.heartbeat()
+                _reap_workers(_workers)
 
-            q = list_queue(paths.queue_dir)
-            running = _phase1_stale_recovery(paths, q)
+                # Check disk space before doing any I/O; warn and skip spawn
+                # if dangerously low (< 1 GB) to avoid cascading failures.
+                st = os.statvfs(str(paths.runs_dir)) if paths.runs_dir.exists() else None
+                free_mb = (st.f_frsize * st.f_bavail) / (1024 * 1024) if st else float("inf")
+                if free_mb < 1024:
+                    if not _disk_warned:
+                        print(f"[scheduler] {now_ts()} LOW DISK: {free_mb:.0f} MB free, skipping I/O",
+                              file=sys.stderr)
+                        _disk_warned = True
+                    time.sleep(max(1, args.poll_seconds))
+                    continue
+                _disk_warned = False
 
-            if not args.no_spawn:
-                running = _phase2_spawn_workers(
-                    paths, q, repo_root, running, _workers, args.max_parallel,
-                )
+                in_window = _in_active_window(time_window)
+                if not in_window:
+                    if _was_active and _workers and args.window_kill:
+                        print(f"[scheduler] {now_ts()} active window ended, terminating {len(_workers)} worker(s)",
+                              file=sys.stderr)
+                        _terminate_workers(_workers)
+                        time.sleep(3)
+                        _reap_workers(_workers)
+                    _was_active = False
 
-            if args.once:
-                break
+                q = list_queue(paths.queue_dir)
+                running = _phase1_stale_recovery(paths, q)
+
+                if not args.no_spawn and in_window:
+                    running = _phase2_spawn_workers(
+                        paths, q, repo_root, running, _workers, args.max_parallel,
+                    )
+                elif not in_window:
+                    running = len(_workers)
+
+                if in_window and not _was_active:
+                    print(f"[scheduler] {now_ts()} active window started", file=sys.stderr)
+                _was_active = in_window
+
+                # Heartbeat every 10 cycles (~5 min at default 30s poll)
+                _tick += 1
+                if _tick % 10 == 0:
+                    rkeys = list(_workers.keys()) if _workers else []
+                    done = 0
+                    for ep in q:
+                        exp = load_exp(ep)
+                        rp = paths.runs_dir / exp["exp_id"] / "exp.json"
+                        if rp.exists():
+                            st = read_json(rp).get("status", "")
+                            if st in ("success", "hard_failure"):
+                                done += 1
+                    pending = len(q) - done - len(rkeys)
+                    print(f"[scheduler] {now_ts()} heartbeat | "
+                          f"running={' '.join(rkeys) if rkeys else 'none'} | "
+                          f"done={done}/{len(q)} pending={pending}",
+                          file=sys.stderr)
+
+                if args.once:
+                    break
+            except OSError as e:
+                print(f"[scheduler] {now_ts()} I/O error (disk full?): {e}", file=sys.stderr)
+                time.sleep(60)
             time.sleep(max(1, args.poll_seconds))
     finally:
         sched_lock.release()

@@ -71,6 +71,8 @@ class LMTrainDataset(Dataset):
         no_model_data["loss_mask"][i][:source_len-1] = 0
         
         if prompt is not None:
+            if len(prompt) > self.max_prompt_length:
+                prompt = prompt[-self.max_prompt_length:]
             gen_data["input_ids"][i][-len(prompt):] = torch.tensor(prompt, dtype=torch.long)
             gen_data["attention_mask"][i][-len(prompt):] = 1.0
 

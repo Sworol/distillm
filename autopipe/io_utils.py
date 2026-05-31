@@ -299,7 +299,8 @@ def classify_failure(log_path: Path) -> str:
     if (re.search(r"\bnan\b", combined) and
             ("loss" in combined or "gradient" in combined or "tensor" in combined)):
         return "nan"
-    if "no space left on device" in combined or "disk full" in combined:
+    if ("no space left on device" in combined or "disk full" in combined
+            or "file write failed" in combined or "inline_container" in combined):
         return "disk_full"
     if "huggingface.co" in combined and ("timeout" in combined or "timed out" in combined or "rate limit" in combined):
         return "hf"

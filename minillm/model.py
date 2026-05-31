@@ -18,6 +18,8 @@ class PPOModel(nn.Module):
         return base_model_outputs
     
     def generate(self, **x):
+        x.pop("mix_in_model", None)
+        x.pop("mix_in_alpha", None)
         return self.base_model.generate(**x)
     
     def set_force_gradient_checkpointing(self, value):

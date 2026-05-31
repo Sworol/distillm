@@ -104,8 +104,11 @@ Start: `python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-para
 ### Architecture
 
 ```
-make_queue.py          →  autopipe/queue/*.json (8 experiments, ordered by numeric prefix)
+make_queue.py          →  autopipe/queue/*.json (10 experiments, ordered by numeric prefix)
 scheduler.py           →  polls queue, picks pending items, spawns workers (max 1 parallel)
+  ├─ Phase 1           →  refresh statuses, recover stale workers, clean orphaned locks
+  ├─ Phase 2           →  spawn new workers for pending/failed items (exp backoff)
+  └─ Heartbeat          →  every 10 cycles (~5min) prints running/done/pending summary
 worker.py              →  runs bash script under conda env, records success/failure
   ├─ classify_failure  →  scans train.log for 15 error patterns (oom, loss_scale, nan, ...)
   ├─ OOM auto-reduce   →  halve batch size, cap at 1
@@ -115,34 +118,83 @@ worker.py              →  runs bash script under conda env, records success/fa
 ### Agent Auto-Repair (`autopipe/agent.py`)
 
 On worker-detected failure that can't be handled by OOM-reduction:
-1. Worker calls `classify_failure()` on train.log → maps to error type (oom, loss_scale, nan, import, port, etc.)
+1. Worker calls `classify_failure()` on train.log → maps to error type
 2. If error is new (by error_hash dedup), invokes `claude` CLI with `--add-dir` pointing to repo root
-3. Agent reads all logs (train.log, previous attempts, agent.log, fix_summary.txt), diagnoses root cause, applies smallest fix, writes one-line summary, exits
+3. Agent reads all logs, diagnoses root cause, applies smallest fix, writes one-line summary, exits
 4. Scheduler retries with exponential backoff (up to `hard_failure_threshold=3` per error hash)
-5. Agent has access to: Read/Write/Edit + Bash (ls, find, cat, grep, pip, python, df, nvidia-smi)
+5. Agent has access to: Edit/Write/Read + Bash (ls, find, cat, grep, pip, python, df, nvidia-smi)
 
-Key agent CLI flags: `-p --no-session-persistence --permission-mode bypassPermissions --add-dir <repo_root>`
+### Scheduler Features
+
+- **PID-based singleton lock** (`.lock_scheduler`): prevents duplicate scheduler processes; detects stale locks (12h timeout) and allows forced steal via `--force-steal-lock`
+- **Time-window scheduling**: `--active-window 22:00-08:00` restricts training to overnight hours; `--window-kill` SIGTERMs workers when window ends (checkpoint-friendly)
+- **Heartbeat**: every 10 poll cycles (~5 min at default 30s), prints running/done/pending counts
+- **Exponential backoff**: failed experiments wait `retry_sleep * 2^consecutive_failures` seconds (capped at 900s)
+- **Aborted hotfix detection**: aborted tasks auto-retry only if queue config mtime > run config mtime (supports hotfix edits)
 
 ### Worker Environment Setup
 
-Before running bash scripts, worker injects:
-- `PATH`: prepends `/anaconda3/envs/{conda_env}/bin/` (ensures correct torchrun, python)
+- `PATH`: prepends conda env bin (ensures correct torchrun, python)
 - `PYTHONPATH`: set to repo root (ensures `data_utils`, `distillm` imports work)
+- `train_opts` from exp.json exported as `TRAIN_{KEY_UPPER}` env vars
+- `HF_ENDPOINT=https://hf-mirror.com` for model downloads in China
 
 ### Queue (sequential execution)
 
 | # | Task | Script | GPUs | Est. Time | Status |
 |---|------|--------|------|-----------|--------|
-| 1 | KD train | `scripts/run_kd_multitask.sh` | 0-3 | ~2-3h | running (attempt 2) |
-| 2 | KD eval | `scripts/run_eval_kd_multitask.sh` | 0 | ~1-2h | pending |
-| 3 | SeqKD gen | `scripts/gpt2/tools/generate_data_seqkd_multitask.sh` | 0-3 | ~12h | pending |
-| 4 | SeqKD process | `scripts/process_seqkd_data.sh` | CPU | ~10min | pending |
-| 5 | SeqKD train | `scripts/gpt2/seqkd/seqkd_multitask_base.sh` | 0-3 | ~2-3h | pending |
-| 6 | SeqKD eval | `scripts/run_eval_seqkd_multitask.sh` | 0 | ~1-2h | pending |
-| 7 | MiniLLM train | `scripts/gpt2/minillm/train_multitask_base_xl.sh` | 0-3 | ~5-10h | pending |
-| 8 | MiniLLM eval | `scripts/run_eval_minillm_multitask.sh` | 0 | ~1-2h | pending |
+| 1 | KD train | `scripts/run_kd_multitask.sh` | 0-3 | ~2-3h | success |
+| 2 | KD eval | `scripts/run_eval_kd_multitask.sh` | 0 | ~1h | success |
+| 3 | SeqKD gen | `scripts/gpt2/tools/generate_data_seqkd_multitask.sh` | 0-3 | ~1.5h | success |
+| 4 | SeqKD process | `scripts/process_seqkd_data.sh` | CPU | ~10min | success |
+| 5 | SeqKD train | `scripts/gpt2/seqkd/seqkd_multitask_base.sh` | 0-3 | ~12h | running (attempt 5/5, epoch 0, iter ~500) |
+| 6 | SeqKD eval | `scripts/run_eval_seqkd_multitask.sh` | 0 | ~1h | failed (dependency: needs seqkd_train ckpt) |
+| 7 | MiniLLM train | `scripts/gpt2/minillm/train_multitask_base_xl.sh` | 0-3 | ~10-20h | failed (killed, attempt 2, agent fixed model_kwargs) |
+| 8 | MiniLLM eval | `scripts/run_eval_minillm_multitask.sh` | 0 | ~1h | failed (needs minillm_train) |
+| 9 | DistiLLM train | `scripts/run_distillm_multitask.sh` | 0-3 | ~5-8h | pending |
+| 10 | DistiLLM eval | `scripts/run_eval_multitask_student.sh` | 0 | ~1h | pending |
 
-Total estimated wall time: ~30-35h
+Total completed so far: 4/10. seqkd_train at 141K steps × 20 epochs → estimated ~12h remaining.
+
+### Data status
+
+| Baseline | Data | Status |
+|----------|------|--------|
+| KD | `processed_data/combined/gpt2/` | Ready |
+| SeqKD gen | `processed_data/combined_prompt/gpt2/` (teacher pseudo-labels) | Generated (60K items) |
+| SeqKD train | `processed_data/combined/pseudo/sft_multitask/gpt2/` (tokenized pseudo-labels) | Ready |
+| MiniLLM | `processed_data/combined_prompt/gpt2/` | Ready |
+| DistiLLM | `processed_data/combined/gpt2/` + `processed_data/openwebtext/gpt2/512/10M/` | Ready |
+
+### Agent Fix Summaries
+
+| Experiment | Attempt | Error | Fix |
+|-----------|---------|-------|-----|
+| kd_train | 2 | GPU OOM (loss_scale underflow) | Reduced lr 0.0005→0.0001; added num_workers=2 |
+| kd_eval | 2 | Checkpoint detection selected eval/ dir | grep -v '/eval/' → config.json check loop |
+| seqkd_gen | 1 | `ImportError: cannot import mpu from transformers` | try/except ImportError in 4 files (mpu removed in transformers>=4.x) |
+| seqkd_process | 1-2 | Cascading: no raw.jsonl from gen | Fixed mpu import in generate.py upstream |
+| seqkd_train | 1-4 | Prompt overflow (368 > max_prompt_length=256) | Truncate prompt at lm_datasets.py:74 |
+| seqkd_train | 4 | Disk full: PyTorch checkpoint write failed | classifies as disk_full now; scheduler tolerates OSError |
+| minillm_train | 2 | `ValueError: mix_in_model` in generate() | Pop unrecognized kwargs before model.generate() (HF >=4.x validation) |
+| minillm_eval | 1 | Dependency: no minillm checkpoint yet | Will auto-resolve once minillm_train succeeds |
+| seqkd_eval | 1-3 | Dependency: no seqkd checkpoint yet | Will auto-resolve once seqkd_train succeeds |
+
+### Autopipe Bug Fixes & Improvements
+
+1. **Queue ordering**: Renamed queue files with `01_`-`10_` numeric prefixes. `make_queue.py` generates prefixed names via `seq` parameter.
+2. **Infinite retry loop**: Fixed `max_retries` exhaustion + automatic `aborted→failed` reset bug. Aborted tasks only auto-retry if queue config mtime > run config mtime (hotfix detection).
+3. **Agent CLI args**: Corrected from `--print` (wrong) to `-p --no-session-persistence --dangerously-skip-permissions --add-dir <repo_root> --agents '<json-spec>' --agent distillm_debugger`.
+4. **hard_failure_threshold merge**: Added to scheduler `merge_keys` so queue updates propagate.
+5. **Conda env injection**: Worker prepends conda bin to PATH, sets PYTHONPATH, exports `TRAIN_*` env vars.
+6. **Failure classification**: 15 error patterns (oom, loss_scale, nan, disk_full, hf, net, import, port, nccl, path, data, shape, assert, killed, ckpt). Extended `disk_full` to catch PyTorch `file write failed` / `inline_container` errors.
+7. **Agent prompt**: Principle-based methodology — agent reads logs itself rather than matching against a pre-enumerated error catalog.
+8. **Scheduler singleton safety**: `Lock.owned()` check every loop; `Lock.heartbeat()` with TOCTOU-safe O_RDWR; SIGTERM/SIGINT handlers terminate tracked workers.
+9. **Worker lock cleanup**: Phase 1 cleans orphaned `.lock_worker` files when status.json shows terminal state.
+10. **train_opts exclude from merge**: Scheduler `merge_keys` skips `train_opts` so agent edits persist across queue merges.
+11. **Time-window scheduling**: `--active-window 22:00-08:00` + `--window-kill` for overnight training.
+12. **Heartbeat**: Every 10 poll cycles prints `running=X done=Y/Z pending=W` summary.
+13. **Scheduler disk-full resilience**: Main loop wrapped in `try/except OSError` + pre-I/O disk check (<1GB skips spawn). Prevents scheduler crash on full disk; worker cleanup runs normally.
 
 ### Data status
 
@@ -179,14 +231,29 @@ Total estimated wall time: ~30-35h
 
 6. **GPU OOM with multi-task Teacher SFT**: gpt2-xlarge (1.5B) with batch_size=2 on combined 60K data OOMed when other processes used ~7.5GB per GPU. Reduced to batch_size=1+grad_acc=2. After killing other processes and freeing full 24GB, batch_size=4 works safely.
 
-7. **Disk full crash**: `results/` accumulated 91GB (old SFT had 10 intermediate 3GB checkpoints per epoch). Cleaned up: deleted debug runs (38G+), removed 9 intermediate checkpoints (27G), kept only final checkpoint. Freed 81G.
+7. **Disk full crash** (May 30): `/home/ufile` hit 100% (1007G). `sft_multitask` had 13 intermediate checkpoints at ~3GB each = ~30GB. Deleted 9 intermediate checkpoints (kept final 37220), freed 26GB. Currently at 98% (27G free) — tight, monitor if training checkpoints accumulate.
 
-8. **Stage 2 eval crash (post-training)**: `finetune.py` eval after training attempts to load model from `{ckpt_dir}/eval/` but it lacks `config.json`. Training checkpoint is valid — this is an eval-only bug. Workaround: skip eval, manually launch next stage.
+8. **Checkpoint naming convention**: Finetune saves checkpoints every epoch unless `--save-interval -1`. For 20-epoch runs, this means 20 checkpoints per experiment at ~1-2GB each for gpt2-base. Delete intermediate checkpoints after completion.
 
 9. **Residual GPU processes**: After killing training, Python processes may not release GPU memory immediately. Use `nvidia-smi` to verify, then `kill -9` residual PIDs.
 
-10. **SINST output format**: SINST data has `output` as list (e.g., `['Response 2']`) not string. Must convert before tokenization with `process_data_dolly.py`.
+10. **SINST output format**: SINST data has `output` as list (e.g., `['Response 2']`) not string. Must convert before tokenization.
 
 11. **`.gitignore` pattern syntax**: `./results/` doesn't work — use `/results/` to anchor to repo root.
 
-12. **Teacher eval hung on Dolly**: First eval run with DeepSpeed on gpt2-xlarge hung indefinitely at ~26% through Dolly (no output for 27h). May be DeepSpeed compatibility issue. Subsequent eval (started separately) completed benchmarks 2-5 normally.
+12. **Teacher eval hung on Dolly**: DeepSpeed eval on gpt2-xlarge hung indefinitely at ~26% through Dolly. Subsequent eval completed normally.
+
+13. **`transformers` 4.43.4 dropped `mpu` module**: `from transformers import mpu` removed in >=4.x. 4 files need try/except ImportError guards (generate.py, minillm/sampler.py, minillm/pipelines.py, minillm/losses.py).
+
+14. **HuggingFace generate() validates model_kwargs**: >=4.x rejects unrecognized keys. `minillm/model.py:generate()` must pop custom keys (mix_in_model, mix_in_alpha) before forwarding.
+
+15. **SeqKD prompts exceed 256 tokens**: Pseudo-label generation can produce prompts longer than max_prompt_length. `lm_datasets.py:74` must truncate: `prompt = prompt[-self.max_prompt_length:]`.
+
+## New Checkpoints Downloaded
+
+| Model | Size | Path |
+|-------|------|------|
+| gpt2-medium | 355M params | `checkpoints/gpt2-medium/` |
+| gpt2-large | 774M params | `checkpoints/gpt2-large/` |
+
+For future medium/large scale distillation experiments.

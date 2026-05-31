@@ -93,6 +93,7 @@ worker.py              →  runs bash scripts under conda env, records outcome, 
 - `Lock.heartbeat()` — updates lock file timestamp each loop so stale detection works correctly
 - Scheduler Phase 1 cleans up stale `.lock_worker` files when status.json shows terminal state but lock file persists (e.g. SIGKILL bypassed worker's `finally` block)
 - **Worker sets its own `status="running"`** after acquiring `.lock_worker` — scheduler does NOT set it, preventing "running but dead" state when worker fails to start
+- **Disk-full resilience** — scheduler main loop wrapped in `try/except OSError`; pre-I/O disk check (<1GB skips spawn); `classify_failure` detects PyTorch `file write failed` / `inline_container` errors in addition to OS-level disk full messages
 
 ### `train_opts` mechanism
 - Single source of truth: `exp.json → train_opts` dict

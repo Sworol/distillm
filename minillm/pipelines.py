@@ -4,7 +4,10 @@ import torch
 import random
 import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import mpu
+try:
+    from transformers import mpu
+except ImportError:
+    mpu = None
 import torch.distributed as dist
 
 from data_utils.distributed_indexed import DistributedMMapIndexedDataset

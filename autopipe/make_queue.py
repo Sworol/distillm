@@ -33,7 +33,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=86400,  # 24h
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=3,
         train_opts=dict(lr=0.0005, batch_size=8, epochs=20, gradient_accumulation_steps=1),
         oom_batch_candidates=[8, 4, 2, 1],
     ))
@@ -46,7 +46,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=86400,
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=3,
     ))
 
     # ============================================================
@@ -60,7 +60,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=172800,  # 48h for 60K generation
         skip_vis=True,
         retry_sleep=60,
-        max_retries=0,
+        max_retries=5,
     ))
 
     specs.append(dict(
@@ -71,7 +71,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=3600,
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=2,
     ))
 
     specs.append(dict(
@@ -82,7 +82,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=86400,
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=5,
         train_opts=dict(lr=0.0005, batch_size=2, epochs=20, gradient_accumulation_steps=1),
         oom_batch_candidates=[2, 1],
     ))
@@ -95,7 +95,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=86400,
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=5,
     ))
 
     # ============================================================
@@ -109,7 +109,7 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=172800,  # 48h for PPO training
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=5,
         train_opts=dict(lr=5e-6, batch_size=8, epochs=10, total_iters=5000,
                         gradient_accumulation_steps=1, chunk_size=16),
         oom_batch_candidates=[8, 4, 2, 1],
@@ -123,7 +123,35 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
         train_timeout=86400,
         skip_vis=True,
         retry_sleep=60,
-        max_retries=1,
+        max_retries=5,
+    ))
+
+
+    # ============================================================
+    # 4. DistiLLM: adaptive skewed KL + replay buffer (main method)
+    # ============================================================
+    specs.append(dict(
+        key="distillm_train",
+        cmd=f"{BASE}/scripts/run_distillm_multitask.sh",
+        conda_env="llm_train",
+        gpus="0,1,2,3",
+        train_timeout=172800,  # 48h — includes on-policy generation
+        skip_vis=True,
+        retry_sleep=60,
+        max_retries=5,
+        train_opts=dict(lr=0.0005, batch_size=4, epochs=20, gradient_accumulation_steps=8),
+        oom_batch_candidates=[4, 2, 1],
+    ))
+
+    specs.append(dict(
+        key="distillm_eval",
+        cmd=f"{BASE}/scripts/run_eval_multitask_student.sh",
+        conda_env="llm_train",
+        gpus="0",
+        train_timeout=86400,
+        skip_vis=True,
+        retry_sleep=60,
+        max_retries=5,
     ))
 
     return specs

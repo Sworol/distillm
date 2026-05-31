@@ -7,7 +7,10 @@ from torchtyping import TensorType
 from .data_types import PPORLBatch
 from .utils import whiten, get_entropy, get_x_entropy, get_log_probs
 
-from transformers import mpu
+try:
+    from transformers import mpu
+except ImportError:
+    mpu = None
 
 from utils import all_gather, print_rank
 
