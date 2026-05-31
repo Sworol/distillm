@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from autopipe.io_utils import now_ts
+from autopipe.io_utils import log_event, now_ts
 
 
 AGENT_NAME = "distillm_debugger"

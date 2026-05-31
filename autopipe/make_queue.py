@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from autopipe.config import HARD_FAILURE_THRESHOLD, default_paths
-from autopipe.io_utils import atomic_write_json, now_ts
+from autopipe.io_utils import atomic_write_json, log_event, now_ts
 
 
 def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
@@ -200,29 +200,35 @@ def main() -> None:
     paths = default_paths(repo_root)
 
     specs = distillm_specs(base=str(repo_root))
+
+    # Build all experiments ONCE so UUIDs are stable between dry-run and actual
+    # output (Bug #5 — previously build_exp was called twice, producing different
+    # UUIDs in each pass).
+    exps = [build_exp(spec, seq=i + 1) for i, spec in enumerate(specs)]
+
+    # Validate script paths.
     errors = 0
-    for i, spec in enumerate(specs):
-        exp = build_exp(spec, seq=i + 1)
+    for exp, spec in zip(exps, specs):
         script_path = _extract_script_path(exp)
         if script_path is not None and not script_path.exists():
-            print(f"ERROR: [{spec['key']}] script not found: {script_path}", file=sys.stderr)
+            log_event(source="make_queue", event="script_not_found",
+                      key=spec["key"], script=str(script_path))
             errors += 1
         elif args.dry_run:
             print(f"OK: [{spec['key']}] {exp['seq']:02d} {script_path or '(no script)'}")
 
     if args.dry_run:
         if errors:
-            print(f"\nDry run: {errors} error(s) found.", file=sys.stderr)
+            log_event(source="make_queue", event="dry_run_errors", error_count=errors)
             sys.exit(1)
         print(f"\nDry run: all {len(specs)} experiment(s) validated.")
         return
 
     paths.queue_dir.mkdir(parents=True, exist_ok=True)
-    for i, spec in enumerate(specs):
-        exp = build_exp(spec, seq=i + 1)
+    errors = 0
+    for exp, spec in zip(exps, specs):
         script_path = _extract_script_path(exp)
         if script_path is not None and not script_path.exists():
-            print(f"ERROR: [{spec['key']}] script not found: {script_path} — skipping", file=sys.stderr)
             errors += 1
             continue
         out = paths.queue_dir / f"{exp['seq']:02d}_{exp['exp_id']}.json"
@@ -230,7 +236,7 @@ def main() -> None:
         print(f"[{spec['key']}] {out}")
 
     if errors:
-        print(f"\n{errors} error(s) — queue generated but {errors} experiment(s) skipped.", file=sys.stderr)
+        log_event(source="make_queue", event="write_errors", error_count=errors)
 
 
 if __name__ == "__main__":

@@ -3,9 +3,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict
+
+
+def log_event(**kwargs: Any) -> None:
+    """Write a structured JSON-line log event to stderr (auto-flush).
+
+    All autopipe diagnostic output goes through this function so logs are
+    machine-parseable.  A ``ts`` field is auto-added if the caller does not
+    supply one.
+    """
+    kwargs.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S"))
+    print(json.dumps(kwargs, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -154,8 +166,7 @@ class Lock:
             if not self.owned():
                 self._pid = None
         except Exception:
-            import sys
-            print(f"[Lock.heartbeat] warning: failed to update lock file {self.path}", file=sys.stderr)
+            log_event(source="lock", event="heartbeat_failed", path=str(self.path))
             pass
 
     def release(self) -> None:

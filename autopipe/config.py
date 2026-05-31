@@ -8,6 +8,18 @@ from pathlib import Path
 # the worker; keep them in sync via this single constant.
 HARD_FAILURE_THRESHOLD = 3
 
+# Config keys that the scheduler may merge from queue definition into the
+# per-experiment working copy.  Bookkeeping fields (attempt, status,
+# updated_at, last_reason, error_hash, etc.) and train_opts are intentionally
+# excluded — the agent edits train_opts and merges would clobber those fixes.
+CONFIG_MERGE_KEYS: frozenset[str] = frozenset([
+    "cfg_path", "trainer", "cmd", "cmd_type", "key", "conda_env",
+    "gpus", "nproc", "master_port", "hf_endpoint",
+    "train_timeout", "hang_timeout", "vis_timeout", "vis_opts",
+    "skip_vis", "retry_sleep", "oom_batch_candidates",
+    "max_retries", "agent_cli", "hard_failure_threshold",
+])
+
 
 @dataclass(frozen=True)
 class Paths:

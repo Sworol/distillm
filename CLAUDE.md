@@ -146,6 +146,30 @@ python3 -m autopipe.scheduler --repo-root . --poll-seconds 30 --max-parallel 1
 - Scheduler log: `autopipe/logs/scheduler_<exp_id>.log`
 - Locks: `.lock_scheduler` (scheduler singleton), `.lock_worker` (per-experiment worker singleton)
 
+### Logging convention
+- All autopipe diagnostic output goes through `log_event(**kwargs)` in `io_utils.py`.
+- Structured JSON-line to stderr with auto-flush. Auto-adds `ts` field.
+- Callers pass `source=<module>` and `event=<name>`, plus any context kwargs.
+- **Never** use `print(..., file=sys.stderr)` — only `log_event()`.
+
+### Config merge keys
+- `CONFIG_MERGE_KEYS` in `config.py` is the single source of truth for keys the scheduler propagates from queue entries to run configs.
+- `train_opts` and bookkeeping fields (attempt, status, error_hash, etc.) are intentionally excluded — agent edits `train_opts` and merges would clobber fixes.
+
+### Worker design rules
+- `_handle_outcome` writes `status.json` **exactly once** — classification + recovery happen before any disk write.
+- `RecoveryManager.handle_failure` works on a **copy** of `ctx.exp`. The returned exp dict is authoritative; callers never read `ctx.exp` after the call.
+- `AttemptContext` (13-field dataclass) replaces positional params for `_handle_outcome`.
+- `FailureContext` (7-field class with `__slots__`) replaces positional params for `RecoveryManager.handle_failure`.
+
+### Tests
+- `autopipe/tests/` — pytest suite (71 tests as of last change):
+  - `test_classify_failure.py` — 40 tests: all 15+ error categories + edge cases (large-log scanning, noise filtering, torchrun boilerplate)
+  - `test_recovery_manager.py` — 10 tests: OOM backoff, agent dedup, hard_failure transitions, non-mutation of ctx.exp
+  - `test_lock.py` — 16 tests: acquire, release, owned, heartbeat, stale detection
+  - `test_worker.py` — 5 tests: `_handle_outcome` success/interrupted/timeout/failed paths, single-write verification
+- Run: `PYTHONPATH=. python -m pytest autopipe/tests/ -v -p no:launch_testing -p no:launch -p no:launch_testing_ros -c /dev/null`
+
 ## Key dependencies
 - conda env `llm_train` with PyTorch 2.4.0, CUDA 12.4
 - transformers 4.43.4

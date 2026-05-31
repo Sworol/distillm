@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from autopipe.io_utils import Lock, atomic_write_json, now_ts, read_json, patch_exp
+from autopipe.io_utils import Lock, atomic_write_json, log_event, now_ts, read_json, patch_exp
 
 
 def recover_stale_worker(

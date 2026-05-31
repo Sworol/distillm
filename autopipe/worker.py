@@ -4,7 +4,6 @@ import argparse
 import enum
 import hashlib
 import os
-import re
 import shutil
 import shlex
 import socket
@@ -22,6 +21,7 @@ from autopipe.io_utils import (
     atomic_write_json,
     classify_failure,
     get_classification_text,
+    log_event,
     now_ts,
     read_json,
 )
@@ -86,6 +86,7 @@ def _hang_watcher(log_path: Path, proc: subprocess.Popen, hang_timeout: int) -> 
         try:
             cur = log_path.stat().st_size
         except OSError:
+            last_change = time.time()
             continue
         if cur != last_size:
             last_size = cur
@@ -165,82 +166,6 @@ def run_cmd(
             _current_subprocess = None
 
 
-def _find_latest_checkpoint(script_text: str, repo_root: Path) -> str | None:
-    """Find the latest valid DeepSpeed checkpoint for a training script.
-
-    Parses ``--save`` from the script, expands known shell variables,
-    and returns the path to the most recent DeepSpeed checkpoint directory
-    (the hp-suffixed parent directory, e.g. ``.../e20-bs2-.../``), or
-    None if no valid checkpoint exists.
-    """
-    base = str(repo_root)
-    # Extract --save argument from the script text.
-    save_arg = None
-    for line in script_text.splitlines():
-        m = re.search(r'--save\s+(\S+)', line)
-        if m:
-            save_arg = m.group(1)
-            break
-    if not save_arg:
-        return None
-
-    # Expand known shell variables that scripts use for the save path.
-    # SAVE_PATH is often set earlier in the script; try to resolve it.
-    save_var = None
-    for line in script_text.splitlines():
-        m = re.match(r'SAVE_PATH="([^"]+)"', line.strip())
-        if m:
-            save_var = m.group(1)
-            break
-    save_arg = save_arg.replace('${SAVE_PATH}', save_var or '')
-    save_arg = save_arg.replace('${BASE_PATH}', base)
-    # Strip shell quoting artifacts (trailing quotes, leading quotes)
-    save_arg = save_arg.strip('\'"')
-
-    save_dir = Path(save_arg)
-    # Collect directories that may contain DeepSpeed checkpoint step dirs.
-    # DeepSpeed auto-appends the hp suffix (e20-bs2-...), so we scan both
-    # the save base and one level below.
-    search_dirs: List[Path] = []
-    _has_numeric_subdir = lambda d: any(
-        sub.is_dir() and sub.name.isdigit() for sub in d.iterdir()
-    )
-    if save_dir.is_dir():
-        if _has_numeric_subdir(save_dir):
-            search_dirs.append(save_dir)
-        for child in save_dir.iterdir():
-            if child.is_dir() and _has_numeric_subdir(child):
-                search_dirs.append(child)
-    else:
-        parent = save_dir.parent
-        if parent.exists():
-            search_dirs.extend(
-                d for d in parent.iterdir()
-                if d.is_dir() and 'e' in d.name[:2] and _has_numeric_subdir(d)
-            )
-
-    best = None
-    best_ts = 0.0
-    for target in search_dirs:
-        ckpt_dirs = [d for d in target.iterdir() if d.is_dir() and d.name.isdigit()]
-        if not ckpt_dirs:
-            continue
-        valid = any(
-            list(cd.glob("zero_to_fp32.py")) or list(cd.glob("*.pt"))
-            or list(cd.glob("pytorch_model.bin")) or list(cd.glob("*.safetensors"))
-            or (cd / "latest").exists()
-            for cd in ckpt_dirs
-        )
-        if not valid:
-            continue
-        mtime = target.stat().st_mtime
-        if mtime > best_ts:
-            best_ts = mtime
-            best = str(target)
-
-    return best
-
-
 def _prepare_environment(
     exp: Dict[str, Any],
     repo_root: Path,
@@ -282,16 +207,6 @@ def _prepare_environment(
     master_port = resolve_master_port(exp) if cmd_type != "bash" else 0
     if cmd_type == "bash":
         train_cmd = ["bash"] + shlex.split(exp["cmd"])
-        # Detect DeepSpeed checkpoint for resume.
-        script_path = Path(shlex.split(exp["cmd"])[0])
-        if script_path.exists():
-            try:
-                script_text = script_path.read_text(encoding="utf-8")
-                ckpt_load = _find_latest_checkpoint(script_text, repo_root)
-                if ckpt_load:
-                    env["AUTOPIPE_LOAD_PATH"] = ckpt_load
-            except Exception:
-                pass
     else:
         train_cmd = [
             sys.executable,
@@ -533,6 +448,50 @@ class FailureContext:
         self.error_hash = error_hash
 
 
+class AttemptContext:
+    """Parameter object for ``_handle_outcome``.
+
+    Replaces the 13 positional arguments that were previously passed to
+    ``_handle_outcome`` so the call site is readable and the signature is
+    stable across changes.
+    """
+
+    __slots__ = (
+        "rc", "run_log", "exp", "run_root", "run_exp_path", "status_path",
+        "attempt", "train_cmd", "env", "cmd_type", "nproc", "repo_root", "agent_timeout",
+    )
+
+    def __init__(
+        self,
+        rc: int,
+        run_log: Path,
+        exp: Dict[str, Any],
+        run_root: Path,
+        run_exp_path: Path,
+        status_path: Path,
+        attempt: int,
+        train_cmd: List[str],
+        env: Dict[str, str],
+        cmd_type: str,
+        nproc: int,
+        repo_root: Path,
+        agent_timeout: int,
+    ):
+        self.rc = rc
+        self.run_log = run_log
+        self.exp = exp
+        self.run_root = run_root
+        self.run_exp_path = run_exp_path
+        self.status_path = status_path
+        self.attempt = attempt
+        self.train_cmd = train_cmd
+        self.env = env
+        self.cmd_type = cmd_type
+        self.nproc = nproc
+        self.repo_root = repo_root
+        self.agent_timeout = agent_timeout
+
+
 class RecoveryManager:
     """Manages training failure recovery: OOM backoff, agent repair, error dedup.
 
@@ -565,65 +524,70 @@ class RecoveryManager:
         ``RecoveryAction.FAILED``, and *exp* is the (possibly agent-modified)
         experiment dict.  The caller must write *exp* to disk and call
         ``sys.exit(ctx.rc)``.
+
+        Works on a copy of ``ctx.exp`` so the caller's reference is never
+        mutated — the returned dict is always the authoritative version.
         """
+        exp = dict(ctx.exp)  # shallow copy — caller uses returned value exclusively
+
         # ---- OOM deterministic backoff (before agent) -----------------------
         if ctx.reason == "oom":
             # Save train_opts before apply_oom_batch_backoff mutates it.
             # If backoff succeeds but we have exhausted oom retries, we must
             # roll back the mutation so the stale smaller batch_size doesn't
             # leak into the next attempt with a stale oom_backoff_count.
-            train_opts_snapshot = dict(ctx.exp.get("train_opts", {}))
-            if apply_oom_batch_backoff(ctx.exp):
-                oom_count = int(ctx.exp.get("oom_backoff_count", 0)) + 1
-                max_oom = int(ctx.exp.get("max_oom_retries", len(ctx.exp.get("oom_batch_candidates", [])) or 0))
+            train_opts_snapshot = dict(exp.get("train_opts", {}))
+            if apply_oom_batch_backoff(exp):
+                oom_count = int(exp.get("oom_backoff_count", 0)) + 1
+                max_oom = int(exp.get("max_oom_retries", len(exp.get("oom_batch_candidates", [])) or 0))
                 if oom_count <= max_oom:
-                    ctx.exp["oom_backoff_count"] = oom_count
-                    ctx.exp["attempt"] = ctx.attempt - 1
-                    ctx.exp["consecutive_failures"] = 0
-                    ctx.exp["status"] = "pending"
-                    ctx.exp["updated_at"] = now_ts()
-                    ctx.exp["error_hash"] = ctx.error_hash
-                    ctx.exp["last_failed_at"] = str(time.time())
-                    return RecoveryAction.OOM_BACKOFF, ctx.exp
+                    exp["oom_backoff_count"] = oom_count
+                    exp["attempt"] = ctx.attempt - 1
+                    exp["consecutive_failures"] = 0
+                    exp["status"] = "pending"
+                    exp["updated_at"] = now_ts()
+                    exp["error_hash"] = ctx.error_hash
+                    exp["last_failed_at"] = str(time.time())
+                    return RecoveryAction.OOM_BACKOFF, exp
                 # oom_count > max_oom: rollback the batch_size mutation so we
                 # don't leak a stale smaller value into agent / hard_failure.
-                ctx.exp["train_opts"] = train_opts_snapshot
-                ctx.exp.pop("last_oom_batch_size", None)
+                exp["train_opts"] = train_opts_snapshot
+                exp.pop("last_oom_batch_size", None)
                 # fall through to agent / hard_failure.
             else:
                 # Already at minimum batch_size — track OOM-at-min to bound retries.
                 # Without this counter a no-agent experiment (max_retries=0) OOMing
                 # at batch_size=1 would retry forever.
-                oom_at_min = int(ctx.exp.get("oom_at_min_count", 0)) + 1
-                ctx.exp["oom_at_min_count"] = oom_at_min
-                max_oom = int(ctx.exp.get("max_oom_retries", len(ctx.exp.get("oom_batch_candidates", [])) or 0))
+                oom_at_min = int(exp.get("oom_at_min_count", 0)) + 1
+                exp["oom_at_min_count"] = oom_at_min
+                max_oom = int(exp.get("max_oom_retries", len(exp.get("oom_batch_candidates", [])) or 0))
                 if max_oom > 0 and oom_at_min > max_oom:
-                    ctx.exp["status"] = "hard_failure"
-                    ctx.exp["updated_at"] = now_ts()
-                    ctx.exp["last_reason"] = (
+                    exp["status"] = "hard_failure"
+                    exp["updated_at"] = now_ts()
+                    exp["last_reason"] = (
                         f"OOM at minimum batch_size persists after {oom_at_min} attempts"
                     )
-                    return RecoveryAction.HARD_FAILURE, ctx.exp
+                    return RecoveryAction.HARD_FAILURE, exp
 
         # ---- Agent dispatch (only when retries remain) --------------------
-        if ctx.attempt <= int(ctx.exp.get("max_retries", 2)):
-            agent_fix_hashes = ctx.exp.get("agent_fix_hashes", {})
-            prev_hash = ctx.exp.get("error_hash", "")
-            hard_limit = int(ctx.exp.get("hard_failure_threshold", HARD_FAILURE_THRESHOLD))
+        if ctx.attempt <= int(exp.get("max_retries", 2)):
+            agent_fix_hashes = exp.get("agent_fix_hashes", {})
+            prev_hash = exp.get("error_hash", "")
+            hard_limit = int(exp.get("hard_failure_threshold", HARD_FAILURE_THRESHOLD))
 
             if ctx.error_hash and ctx.error_hash == prev_hash:
                 # Agent already ran for this hash — increment counter.
                 agent_fix_hashes[ctx.error_hash] = int(agent_fix_hashes.get(ctx.error_hash, 0)) + 1
-                ctx.exp["agent_fix_hashes"] = agent_fix_hashes
+                exp["agent_fix_hashes"] = agent_fix_hashes
                 agent_fix_count = agent_fix_hashes[ctx.error_hash]
                 if agent_fix_count >= hard_limit:
-                    ctx.exp["status"] = "hard_failure"
-                    ctx.exp["updated_at"] = now_ts()
-                    ctx.exp["last_reason"] = (
+                    exp["status"] = "hard_failure"
+                    exp["updated_at"] = now_ts()
+                    exp["last_reason"] = (
                         f"agent failed to fix '{ctx.reason}' "
                         f"after {agent_fix_count} attempts (hash={ctx.error_hash})"
                     )
-                    return RecoveryAction.HARD_FAILURE, ctx.exp
+                    return RecoveryAction.HARD_FAILURE, exp
 
                 with open(self._run_root / "agent_skip.txt", "a", encoding="utf-8") as f:
                     f.write(
@@ -638,8 +602,8 @@ class RecoveryManager:
                         self._run_root,
                         repo_root=self._repo_root,
                         timeout_seconds=self._agent_timeout,
-                        agent_cli=ctx.exp.get("agent_cli", "claude"),
-                        conda_env=ctx.exp.get("conda_env", "llm_train"),
+                        agent_cli=exp.get("agent_cli", "claude"),
+                        conda_env=exp.get("conda_env", "llm_train"),
                     )
                     snapshot_git(self._repo_root, self._run_root, "post_agent")
                     agent_fix_hashes[ctx.error_hash] = int(agent_fix_hashes.get(ctx.error_hash, 0)) + 1
@@ -647,19 +611,19 @@ class RecoveryManager:
                     # IMPORTANT: if the re-read fails we keep the old exp AND log a
                     # warning — previously we silently clobbered agent fixes on error.
                     try:
-                        ctx.exp = read_json(ctx.run_exp_path)
+                        exp = read_json(ctx.run_exp_path)
                     except Exception as read_exc:
                         with open(self._run_root / "agent_error.txt", "a", encoding="utf-8") as f:
                             f.write(
                                 f"{now_ts()} WARNING: failed to re-read exp.json after agent — "
                                 f"agent fixes may be lost: {repr(read_exc)}\n"
                             )
-                    ctx.exp["agent_fix_hashes"] = agent_fix_hashes
+                    exp["agent_fix_hashes"] = agent_fix_hashes
                 except Exception as exc:
                     with open(self._run_root / "agent_error.txt", "a", encoding="utf-8") as f:
                         f.write(f"{now_ts()} {repr(exc)}\n")
 
-        return RecoveryAction.FAILED, ctx.exp
+        return RecoveryAction.FAILED, exp
 
 
 def main() -> None:
@@ -700,13 +664,13 @@ def main() -> None:
                 "reason": f"validation_error: {exc}",
             },
         )
-        print(f"[worker] hard_failure: {exc}", file=sys.stderr)
+        log_event(source="worker", event="hard_failure", error=str(exc))
         sys.exit(1)
 
     global _worker_lock
     lock = Lock(run_root / ".lock_worker", stale_seconds=12 * 3600)
     if not lock.acquire():
-        print(f"[worker] lock busy: {run_root}", file=sys.stderr)
+        log_event(source="worker", event="lock_busy", run_root=str(run_root))
         sys.exit(2)
     _worker_lock = lock
 
@@ -760,80 +724,59 @@ def main() -> None:
                 f.write(f"\n==== {now_ts()} INTERRUPTED (KeyboardInterrupt)\n".encode())
             rc = 130
 
-        _handle_outcome(
-            rc, run_log, exp, run_root, run_exp_path, status_path,
-            attempt, train_cmd, env, cmd_type, nproc, repo_root, args.agent_timeout,
-        )
+        _handle_outcome(AttemptContext(
+            rc=rc, run_log=run_log, exp=exp, run_root=run_root,
+            run_exp_path=run_exp_path, status_path=status_path,
+            attempt=attempt, train_cmd=train_cmd, env=env,
+            cmd_type=cmd_type, nproc=nproc, repo_root=repo_root,
+            agent_timeout=args.agent_timeout,
+        ))
     finally:
         lock.release()
 
 
-def _handle_outcome(
-    rc: int,
-    run_log: Path,
-    exp: Dict[str, Any],
-    run_root: Path,
-    run_exp_path: Path,
-    status_path: Path,
-    attempt: int,
-    train_cmd: List[str],
-    env: Dict[str, str],
-    cmd_type: str,
-    nproc: int,
-    repo_root: Path,
-    agent_timeout: int,
-) -> None:
-    """Process the training result.  Always ends with ``sys.exit()``."""
-    if rc == 0:
+def _handle_outcome(ctx: AttemptContext) -> None:
+    """Process the training result.  Always ends with ``sys.exit()``.
+
+    Status is written to ``status.json`` exactly once — classification and
+    recovery happen before any disk write, eliminating the previous race
+    window where two writes could leave stale intermediate state on disk.
+    """
+    if ctx.rc == 0:
         atomic_write_json(
-            status_path,
-            {"status": "success", "updated_at": now_ts(), "attempt": attempt},
+            ctx.status_path,
+            {"status": "success", "updated_at": now_ts(), "attempt": ctx.attempt},
         )
-        exp["status"] = "success"
-        exp["updated_at"] = now_ts()
-        exp["consecutive_failures"] = 0
-        exp["error_hash"] = ""
-        exp["last_failed_at"] = ""
-        atomic_write_json(run_exp_path, exp)
+        ctx.exp["status"] = "success"
+        ctx.exp["updated_at"] = now_ts()
+        ctx.exp["consecutive_failures"] = 0
+        ctx.exp["error_hash"] = ""
+        ctx.exp["last_failed_at"] = ""
+        atomic_write_json(ctx.run_exp_path, ctx.exp)
         sys.exit(0)
 
-    # ---- Failure classification & recording ----------------------------
-    if rc == 130:
+    # ---- Failure classification (BEFORE any disk writes) ----------------
+    if ctx.rc == 130:
         reason = "interrupted"
-    elif rc == 124:
+    elif ctx.rc == 124:
         reason = "timeout"
     else:
-        reason = classify_failure(run_log)
-    error_hash = _last_error_hash(run_log)
-    atomic_write_json(
-        status_path,
-        {
-            "status": "failed",
-            "updated_at": now_ts(),
-            "attempt": attempt,
-            "exit_code": rc,
-            "reason": reason,
-            "train_cmd": train_cmd,
-            "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES"),
-            "hf_endpoint": env.get("HF_ENDPOINT"),
-            "nproc": nproc,
-            "master_port": exp.get("master_port", 0),
-            "error_hash": error_hash,
-        },
-    )
+        reason = classify_failure(ctx.run_log)
+    error_hash = _last_error_hash(ctx.run_log)
 
-    # ---- Recovery ------------------------------------------------------
-    recovery = RecoveryManager(run_root, repo_root, agent_timeout)
-    ctx = FailureContext(
-        exp=exp, run_exp_path=run_exp_path, status_path=status_path,
-        attempt=attempt, rc=rc, reason=reason, error_hash=error_hash,
+    # ---- Recovery (decides final status) ---------------------------------
+    recovery = RecoveryManager(ctx.run_root, ctx.repo_root, ctx.agent_timeout)
+    fctx = FailureContext(
+        exp=ctx.exp, run_exp_path=ctx.run_exp_path, status_path=ctx.status_path,
+        attempt=ctx.attempt, rc=ctx.rc, reason=reason, error_hash=error_hash,
     )
-    action, exp = recovery.handle_failure(ctx)
+    action, exp = recovery.handle_failure(fctx)
 
+    # ---- Write status.json EXACTLY ONCE ----------------------------------
     if action == RecoveryAction.OOM_BACKOFF:
-        atomic_write_json(run_exp_path, exp)
+        atomic_write_json(ctx.run_exp_path, exp)
         atomic_write_json(
-            status_path,
+            ctx.status_path,
             {
                 "status": "pending", "updated_at": now_ts(),
                 "attempt": exp["attempt"],
@@ -842,38 +785,48 @@ def _handle_outcome(
                 "error_hash": error_hash,
             },
         )
-        sys.exit(rc)
+        sys.exit(ctx.rc)
 
     if action == RecoveryAction.HARD_FAILURE:
-        atomic_write_json(run_exp_path, exp)
+        atomic_write_json(ctx.run_exp_path, exp)
         atomic_write_json(
-            status_path,
+            ctx.status_path,
             {
                 "status": "hard_failure", "updated_at": now_ts(),
-                "attempt": attempt, "exit_code": rc,
+                "attempt": ctx.attempt, "exit_code": ctx.rc,
                 "reason": exp.get("last_reason", f"hard_failure:{reason}"),
                 "error_hash": error_hash,
             },
         )
-        sys.exit(rc)
+        sys.exit(ctx.rc)
 
-    # RecoveryAction.FAILED
+    # RecoveryAction.FAILED — single write with full metadata.
     exp["status"] = "failed"
     exp["updated_at"] = now_ts()
-    exp["last_exit_code"] = rc
+    exp["last_exit_code"] = ctx.rc
     exp["last_reason"] = reason
     exp["error_hash"] = error_hash
     exp["consecutive_failures"] = int(exp.get("consecutive_failures", 0)) + 1
     exp["last_failed_at"] = str(time.time())
-    atomic_write_json(run_exp_path, exp)
+    atomic_write_json(ctx.run_exp_path, exp)
 
-    try:
-        st = read_json(status_path)
-        st["error_hash"] = error_hash
-        atomic_write_json(status_path, st)
-    except Exception:
-        pass
-    sys.exit(rc)
+    atomic_write_json(
+        ctx.status_path,
+        {
+            "status": "failed",
+            "updated_at": now_ts(),
+            "attempt": ctx.attempt,
+            "exit_code": ctx.rc,
+            "reason": reason,
+            "train_cmd": ctx.train_cmd,
+            "cuda_visible_devices": ctx.env.get("CUDA_VISIBLE_DEVICES"),
+            "hf_endpoint": ctx.env.get("HF_ENDPOINT"),
+            "nproc": ctx.nproc,
+            "master_port": exp.get("master_port", 0),
+            "error_hash": error_hash,
+        },
+    )
+    sys.exit(ctx.rc)
 
 
 if __name__ == "__main__":

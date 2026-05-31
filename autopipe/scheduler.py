@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from autopipe.config import default_paths
-from autopipe.io_utils import Lock, atomic_write_json, now_ts, patch_exp, read_json
+from autopipe.config import CONFIG_MERGE_KEYS, default_paths
+from autopipe.io_utils import Lock, atomic_write_json, log_event, now_ts, patch_exp, read_json
 from autopipe.recovery import recover_stale_worker
 
 
@@ -44,19 +44,6 @@ def _load_run_exp(queue_exp: Dict[str, Any], run_exp_path: Path) -> Dict[str, An
             return dict(queue_exp)
         return exp
     return dict(queue_exp)
-
-
-# Config keys that the scheduler may merge from queue definition into the
-# per-experiment working copy.  Bookkeeping fields (attempt, status,
-# updated_at, last_reason, error_hash, etc.) and train_opts are intentionally
-# excluded — the agent edits train_opts and merges would clobber those fixes.
-MERGE_KEYS = [
-    "cfg_path", "trainer", "cmd", "cmd_type", "key", "conda_env",
-    "gpus", "nproc", "master_port", "hf_endpoint",
-    "train_timeout", "hang_timeout", "vis_timeout", "vis_opts",
-    "skip_vis", "retry_sleep", "oom_batch_candidates",
-    "max_retries", "agent_cli", "hard_failure_threshold",
-]
 
 
 def _phase1_stale_recovery(paths, q: List[Path]) -> int:
@@ -180,7 +167,7 @@ def _phase2_spawn_workers(
             except Exception:
                 cur = exp
             changed = False
-            for k in MERGE_KEYS:
+            for k in CONFIG_MERGE_KEYS:
                 if k in queue_exp and cur.get(k) != queue_exp.get(k):
                     cur[k] = queue_exp.get(k)
                     changed = True
@@ -322,13 +309,13 @@ def main():
                 except Exception:
                     pass
                 if not sched_lock.acquire():
-                    print("[scheduler] lock busy (failed to steal)", file=sys.stderr)
+                    log_event(source="scheduler", event="lock_busy", detail="failed_to_steal")
                     sys.exit(2)
             else:
-                print("[scheduler] already running (pid alive or unreadable)", file=sys.stderr)
+                log_event(source="scheduler", event="lock_busy", detail="pid_alive_or_unreadable")
                 sys.exit(2)
         else:
-            print("[scheduler] already running", file=sys.stderr)
+            log_event(source="scheduler", event="lock_busy")
             sys.exit(2)
 
     # Track spawned worker processes so we can terminate them on shutdown
@@ -345,7 +332,7 @@ def main():
         while True:
             try:
                 if not sched_lock.owned():
-                    print("[scheduler] lock lost (stolen by another process), exiting", file=sys.stderr)
+                    log_event(source="scheduler", event="lock_lost", detail="stolen")
                     sys.exit(2)
                 sched_lock.heartbeat()
                 _reap_workers(_workers)
@@ -356,8 +343,8 @@ def main():
                 free_mb = (st.f_frsize * st.f_bavail) / (1024 * 1024) if st else float("inf")
                 if free_mb < 1024:
                     if not _disk_warned:
-                        print(f"[scheduler] {now_ts()} LOW DISK: {free_mb:.0f} MB free, skipping I/O",
-                              file=sys.stderr)
+                        log_event(source="scheduler", event="low_disk",
+                                  free_mb=round(free_mb))
                         _disk_warned = True
                     time.sleep(max(1, args.poll_seconds))
                     continue
@@ -366,8 +353,8 @@ def main():
                 in_window = _in_active_window(time_window)
                 if not in_window:
                     if _was_active and _workers and args.window_kill:
-                        print(f"[scheduler] {now_ts()} active window ended, terminating {len(_workers)} worker(s)",
-                              file=sys.stderr)
+                        log_event(source="scheduler", event="active_window_ended",
+                                  worker_count=len(_workers))
                         _terminate_workers(_workers)
                         time.sleep(3)
                         _reap_workers(_workers)
@@ -384,7 +371,7 @@ def main():
                     running = len(_workers)
 
                 if in_window and not _was_active:
-                    print(f"[scheduler] {now_ts()} active window started", file=sys.stderr)
+                    log_event(source="scheduler", event="active_window_started")
                 _was_active = in_window
 
                 # Heartbeat every 10 cycles (~5 min at default 30s poll)
@@ -400,15 +387,14 @@ def main():
                             if st in ("success", "hard_failure"):
                                 done += 1
                     pending = len(q) - done - len(rkeys)
-                    print(f"[scheduler] {now_ts()} heartbeat | "
-                          f"running={' '.join(rkeys) if rkeys else 'none'} | "
-                          f"done={done}/{len(q)} pending={pending}",
-                          file=sys.stderr)
+                    log_event(source="scheduler", event="heartbeat",
+                              running_ids=rkeys if rkeys else [],
+                              done=done, total=len(q), pending=pending)
 
                 if args.once:
                     break
             except OSError as e:
-                print(f"[scheduler] {now_ts()} I/O error (disk full?): {e}", file=sys.stderr)
+                log_event(source="scheduler", event="io_error", error=str(e))
                 time.sleep(60)
             time.sleep(max(1, args.poll_seconds))
     finally:
