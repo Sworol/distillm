@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 import uuid
 from pathlib import Path
@@ -158,11 +159,30 @@ def distillm_specs(base: str | None = None) -> List[Dict[str, Any]]:
 
 
 def _extract_script_path(exp: Dict[str, Any]) -> Path | None:
-    """Return the Path to the bash script referenced by *exp*, or None."""
+    """Return the Path to the bash script referenced by *exp*, or None.
+
+    Handles ``cmd`` values like ``/path/to/script.sh`` as well as
+    ``bash /path/to/script.sh`` (skipping the leading shell interpreter).
+
+    Returns None for shell constructs like ``bash -c 'echo hi'`` (inline
+    commands with no on-disk script) or malformed commands.
+    """
     if exp.get("cmd_type") != "bash":
         return None
-    parts = exp["cmd"].split()
-    return Path(parts[0]) if parts else Path(exp["cmd"])
+    try:
+        parts = shlex.split(exp["cmd"])
+    except Exception:
+        return None
+    if not parts:
+        return None
+    first = Path(parts[0])
+    # If the first token is a known shell interpreter, use the next token.
+    if first.name in ("bash", "sh", "zsh") and len(parts) > 1:
+        # "bash -c '...'": inline command, not a script path.
+        if parts[1] == "-c":
+            return None
+        return Path(parts[1])
+    return first
 
 
 def build_exp(spec: Dict[str, Any], seq: int) -> Dict[str, Any]:
@@ -225,10 +245,21 @@ def main() -> None:
         return
 
     paths.queue_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove any existing queue files from previous runs to prevent stale
+    # entries from being picked up by the scheduler alongside new experiments.
+    for prev in paths.queue_dir.glob("*.json"):
+        try:
+            prev.unlink()
+        except Exception:
+            pass
+
     errors = 0
     for exp, spec in zip(exps, specs):
         script_path = _extract_script_path(exp)
         if script_path is not None and not script_path.exists():
+            log_event(source="make_queue", event="skip_missing_script",
+                      key=spec["key"], script=str(script_path))
             errors += 1
             continue
         out = paths.queue_dir / f"{exp['seq']:02d}_{exp['exp_id']}.json"

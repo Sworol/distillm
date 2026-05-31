@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -21,7 +22,13 @@ Fix the training failure in this experiment directory. Steps:
 
 
 def _build_system_prompt(repo_root: str, conda_env: str) -> str:
-    """Build the agent system prompt with project context injected."""
+    """Build the agent system prompt with project context injected.
+
+    NOTE: This prompt intentionally omits hardcoded model/GPU details (unlike
+    earlier versions).  The agent should derive hardware and model information
+    from the actual logs, exp.json, and shell scripts — not from a cached
+    prompt that may go stale when experiments change.
+    """
     return (
         "You are a senior ML engineer debugging failed training experiments for "
         "the DistiLLM project (LLM knowledge distillation with DeepSpeed). "
@@ -29,7 +36,7 @@ def _build_system_prompt(repo_root: str, conda_env: str) -> str:
         "PROJECT CONTEXT:\n"
         f"- Repo root: {repo_root}\n"
         f"- Conda env: {conda_env}\n"
-        "- Training: DeepSpeed ZeRO-1 FP16, 4x RTX 4090 (24GB), gpt2-base (124M) <- gpt2-xlarge (1.5B)\n"
+        "- Training uses DeepSpeed ZeRO with FP16 mixed precision\n"
         "- Experiments use cmd_type bash - the cmd field in exp.json points to the shell script\n"
         "- Worker exports exp.json train_opts as TRAIN_* env vars before running scripts\n"
         "- Shell scripts read TRAIN_LR, TRAIN_BATCH_SIZE, TRAIN_EPOCHS, TRAIN_GRADIENT_ACCUMULATION_STEPS with fallback defaults\n"
@@ -52,19 +59,42 @@ def _build_agent_spec(repo_root: str, conda_env: str) -> str:
 
 
 def _resolve_agent(agent_cli: str = "auto") -> str:
-    """Determine which agent CLI to use. Returns 'claude' or 'codex'."""
+    """Determine which agent CLI to use. Returns 'claude' or 'codex'.
+
+    Raises RuntimeError if the requested CLI is not found or is not executable
+    (e.g., ``shutil.which`` found a broken symlink, or the binary is corrupt).
+    """
+
+    def _check_binary(name: str) -> str:
+        path = shutil.which(name)
+        if path is None:
+            raise RuntimeError(f"agent_cli='{name}' but '{name}' CLI not found on PATH")
+        # Verify the binary is executable (detect broken symlinks, non-executable
+        # files that shutil.which might still return on some systems).
+        if not os.access(path, os.X_OK):
+            raise RuntimeError(
+                f"agent_cli='{name}' found at '{path}' but is not executable"
+            )
+        return name
+
+    def _check_binary_graceful(name: str) -> bool:
+        """Return True if *name* is on PATH and executable, False otherwise."""
+        path = shutil.which(name)
+        if path is None:
+            return False
+        try:
+            return os.access(path, os.X_OK)
+        except Exception:
+            return False
+
     if agent_cli == "claude":
-        if not shutil.which("claude"):
-            raise RuntimeError("agent_cli='claude' but 'claude' CLI not found on PATH")
-        return "claude"
+        return _check_binary("claude")
     if agent_cli == "codex":
-        if not shutil.which("codex"):
-            raise RuntimeError("agent_cli='codex' but 'codex' CLI not found on PATH")
-        return "codex"
+        return _check_binary("codex")
     # auto: probe for available CLIs, prefer claude
-    if shutil.which("claude"):
+    if _check_binary_graceful("claude"):
         return "claude"
-    if shutil.which("codex"):
+    if _check_binary_graceful("codex"):
         return "codex"
     raise RuntimeError("No agent CLI found on PATH (tried: claude, codex). "
                        "Install one or pass agent_cli='claude'/'codex' explicitly.")
@@ -92,12 +122,15 @@ def run_agent(
             "--agents", agent_spec,
             "--agent", AGENT_NAME,
             "--allowedTools",
-            "Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,rg:*,wc:*,cp:*,mv:*,mkdir:*,rm:*,rmdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
+            "Glob,Grep,Edit,Write,Read,Bash(ls:*,find:*,cat:*,head:*,tail:*,grep:*,rg:*,wc:*,cp:*,mv:*,mkdir:*,rm:*,rmdir:*,pip:*,pip3:*,python:*,python3:*,df:*,du:*,nvidia-smi:*,conda:*,git:*)",
             "-",  # read task from stdin
         ]
     else:
         # codex: inject project context directly into the prompt (same context
         # that the claude path gets via --agents).
+        # NOTE: The full prompt appears as a positional argument and is visible
+        # in /proc/*/cmdline.  The claude path passes via stdin, which is more
+        # private.  This is an inherent codex CLI design limitation.
         system_prompt = _build_system_prompt(str(repo_root), conda_env)
         full_prompt = system_prompt + "\n\nTASK:\n" + TASK_PROMPT
         cmd = [
@@ -113,6 +146,7 @@ def run_agent(
         f.write(f"\n==== {now_ts()} AGENT_START ({cli}): {' '.join(shlex.quote(str(x)) for x in cmd)}\n".encode())
         # buffering=0 above already ensures unbuffered writes; no need for flush()
         try:
+            use_text = cli == "claude"
             completed = subprocess.run(
                 cmd,
                 cwd=str(exp_dir),
@@ -120,12 +154,15 @@ def run_agent(
                 stderr=subprocess.STDOUT,
                 timeout=timeout_seconds,
                 check=False,
-                input=TASK_PROMPT if cli == "claude" else None,
-                text=True if cli == "claude" else False,
+                input=TASK_PROMPT if use_text else None,
+                text=use_text,
             )
             return int(completed.returncode)
         except subprocess.TimeoutExpired:
             f.write(f"\n==== {now_ts()} AGENT_TIMEOUT after {timeout_seconds}s\n".encode())
             return 124
+        except (OSError, ValueError, UnicodeError) as exc:
+            f.write(f"\n==== {now_ts()} AGENT_IO_ERROR: {repr(exc)}\n".encode())
+            return 1
 
 

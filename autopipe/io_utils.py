@@ -17,7 +17,12 @@ def log_event(**kwargs: Any) -> None:
     supply one.
     """
     kwargs.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S"))
-    print(json.dumps(kwargs, ensure_ascii=False), file=sys.stderr, flush=True)
+    try:
+        print(json.dumps(kwargs, ensure_ascii=False), file=sys.stderr, flush=True)
+    except (BrokenPipeError, OSError):
+        # stderr may be closed or broken (e.g. parent process died).
+        # There is nothing we can do — swallow silently.
+        pass
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -98,17 +103,21 @@ class Lock:
                 return True
             except FileExistsError:
                 # Best-effort stale cleanup.
-                # Before unlinking, verify that the lock holder PID is dead.
-                # This closes the TOCTOU window between stat() and unlink():
-                # if a new process acquired the lock in that window, its PID
-                # will be alive, and we leave it alone.
+                # Before unlinking, verify that the lock holder PID is dead
+                # AND that the inode hasn't changed between our stat+read and
+                # the unlink (closes the TOCTOU where a new process could
+                # acquire the lock in that window).
                 try:
                     st = self.path.stat()
                     if time.time() - st.st_mtime > self.stale_seconds:
+                        inode_before = st.st_ino
                         lock_pid = self._read_lock_pid(self.path)
                         if lock_pid is not None and not self._pid_alive(lock_pid):
-                            self.path.unlink(missing_ok=True)
-                            continue
+                            # Re-check inode: if it changed, a new process
+                            # acquired the lock and we must not touch it.
+                            if self.path.stat().st_ino == inode_before:
+                                self.path.unlink(missing_ok=True)
+                                continue
                 except FileNotFoundError:
                     pass
                 return False
@@ -130,39 +139,32 @@ class Lock:
     def heartbeat(self) -> None:
         """Update the lock file timestamp so stale detection works correctly.
 
-        Uses O_RDWR (not O_TRUNC) to avoid a TOCTOU race: if another process
-        stole the lock between the owned() check and the write, O_RDWR opens
-        whatever inode the path currently points to. We read the PID from the
-        opened fd, and only rewrite if we still own it.
+        Writes to a temporary file then atomically renames over the lock path.
+        This avoids the empty-file window that ftruncate+write creates on crash:
+        if the process dies between ftruncate and the first write, the lock
+        file exists but is empty, making stale detection fall through to
+        mtime-based checks.
 
-        After writing, we re-verify ownership via self.path (which may point
-        to a different inode if the lock was stolen). If the post-write check
-        fails, we mark eviction by clearing self._pid.
+        We verify ownership by reading the current lock's PID before writing
+        the replacement.
         """
         if self._pid is None:
             return
         try:
-            fd = os.open(self.path, os.O_RDWR)
-            try:
-                data = os.read(fd, 4096).decode("utf-8", errors="replace")
-                owned = False
-                for line in data.splitlines():
-                    if line.strip().startswith(f"pid={self._pid}"):
-                        owned = True
-                        break
-                if not owned:
-                    self._pid = None
-                    return
-                os.ftruncate(fd, 0)
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.write(fd, f"pid={self._pid}\n".encode())
-                os.write(fd, f"ts={now_ts()}\n".encode())
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            # Post-write verification: if the lock was stolen (new inode),
-            # our write went to the orphaned inode and self.owned() will
-            # return False when reading the current path.
+            # Verify we still own the lock before writing.
+            lock_pid = self._read_lock_pid(self.path)
+            if lock_pid != self._pid:
+                self._pid = None
+                return
+            # Write to temp file, then atomically rename to avoid empty-window.
+            tmp = self.path.with_suffix(self.path.suffix + f".hb.{os.getpid()}")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(f"pid={self._pid}\n")
+                f.write(f"ts={now_ts()}\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            # Post-rename verification: ensure we still own it.
             if not self.owned():
                 self._pid = None
         except Exception:
@@ -176,6 +178,7 @@ class Lock:
             self.path.unlink()
         except FileNotFoundError:
             pass
+        self._pid = None
 
 
 def scan_log_chunk(path: Path, start_pos: int, chunk_size: int) -> str:
@@ -267,8 +270,8 @@ def _filter_noise(text: str) -> str:
     lines = []
     for line in text.splitlines():
         lower = line.strip().lower()
-        if re.search(r'(?:\[.*?\]\s*:?\s*)?(warning|info)\b', lower):
-            if not re.search(r'\b(error|exception|traceback|fatal|critical|oom|out of memory|nan)\b', lower):
+        if re.search(r'(?:\[[^\]]*\]\s*:?\s*)*\b(warning|info)\b', lower):
+            if not re.search(r'\b(error|exception|traceback|fatal|critical|oom|out of memory|nan|sigterm|signal|killed|timeout|disk|connection|assert)\b', lower):
                 continue
         lines.append(line)
     return "\n".join(lines)
@@ -297,7 +300,7 @@ def classify_failure(log_path: Path) -> str:
     # of OOM-like symptoms, and OOM batch reduction won't fix it.
     if "loss scale" in combined and ("minimum" in combined or "cannot decrease" in combined):
         return "loss_scale"
-    if "cuda out of memory" in combined or ("out of memory" in combined and "cuda" in combined):
+    if "cuda out of memory" in combined or _proximity_match(combined, "out of memory", "cuda", max_distance=500):
         return "oom"
     # Detect system OOM-killer: kernel logs "Out of memory: Killed process" to dmesg/stderr.
     # We require "out of memory" and "killed" close together (within 500 chars) to avoid
@@ -334,7 +337,12 @@ def classify_failure(log_path: Path) -> str:
         return "shape"
     if "assertionerror" in combined or ("assertion" in combined and ("error" in combined or "failed" in combined)):
         return "assert"
-    if "sigterm" in combined or "keyboardinterrupt" in combined or "process killed" in combined:
+    if "sigterm" in combined or "keyboardinterrupt" in combined:
+        return "killed"
+    # "process killed" is common in kernel OOM logs ("Out of memory: Killed
+    # process 12345").  Only classify as "killed" if it is NOT in the
+    # proximity of an OOM message (which would already be caught above).
+    if "process killed" in combined and not _proximity_match(combined, "killed", "out of memory", max_distance=500):
         return "killed"
 
     return "other"

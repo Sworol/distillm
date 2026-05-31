@@ -4,6 +4,7 @@ import argparse
 import enum
 import hashlib
 import os
+import re
 import shutil
 import shlex
 import socket
@@ -39,6 +40,14 @@ _worker_lock: "Lock | None" = None
 
 
 def _sigterm_handler(signum: int, frame: Any) -> None:
+    # Prevent re-entry: if the handler fires recursively (e.g. os.kill at
+    # the end sends SIGTERM to self), the second invocation sees this flag
+    # and falls through to SIG_DFL.
+    if getattr(_sigterm_handler, "_handled", False):
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+        return
+    _sigterm_handler._handled = True
     proc = _current_subprocess
     if proc is not None and proc.poll() is None:
         try:
@@ -61,8 +70,7 @@ def _sigterm_handler(signum: int, frame: Any) -> None:
             lock.release()
         except Exception:
             pass
-    # Restore default handler and re-send so the process terminates normally.
-    signal.signal(signum, signal.SIG_DFL)
+    # _handled=True above guards the re-entry from this kill.
     os.kill(os.getpid(), signum)
 
 
@@ -92,6 +100,12 @@ def _hang_watcher(log_path: Path, proc: subprocess.Popen, hang_timeout: int) -> 
             last_size = cur
             last_change = time.time()
         elif time.time() - last_change > hang_timeout:
+            # Process may have exited naturally during sleep/stat. Re-check
+            # before sending any signal to avoid a PID-reuse race: if the
+            # original process died and the kernel recycled its PID to a new
+            # process group, os.killpg would SIGTERM an unrelated workload.
+            if proc.poll() is not None:
+                return
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
@@ -99,21 +113,31 @@ def _hang_watcher(log_path: Path, proc: subprocess.Popen, hang_timeout: int) -> 
             return
 
 
-def _kill_and_wait(proc: subprocess.Popen, exit_code: int) -> int:
-    """Send SIGTERM, wait up to 30 s, then SIGKILL if still alive. Returns exit code."""
+def _kill_and_wait(proc: subprocess.Popen, fallback_code: int) -> int:
+    """Send SIGTERM, wait up to 30 s, then SIGKILL if still alive.
+
+    Always returns *fallback_code* — never the process exit code — because
+    callers use the return value to classify outcomes (124=timeout, 130=interrupt).
+    Returning the process signal code (-15/-9) would cause ``_handle_outcome`` to
+    misclassify a timeout as ``"killed"``.
+    """
     pgid = os.getpgid(proc.pid)
     try:
         os.killpg(pgid, signal.SIGTERM)
     except Exception:
         pass
     try:
-        return proc.wait(timeout=30)
+        proc.wait(timeout=30)
     except Exception:
         try:
             os.killpg(pgid, signal.SIGKILL)
         except Exception:
             pass
-        return exit_code
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+    return fallback_code
 
 
 def run_cmd(
@@ -134,6 +158,10 @@ def run_cmd(
         f.write(f"\n==== {now_ts()} COMMAND: {' '.join(cmd)}\n".encode())
         f.flush()
         # Create a new process group so we can terminate all children on shutdown.
+        # There is an unavoidable race between the kernel creating the process
+        # (in Popen) and _current_subprocess becoming visible to the SIGTERM
+        # handler.  If SIGTERM lands in this window the handler sees the
+        # previous (already reaped) _current_subprocess, which is acceptable.
         proc = subprocess.Popen(
             cmd,
             stdout=f,
@@ -141,8 +169,6 @@ def run_cmd(
             env=env,
             start_new_session=True,
         )
-        # Set global BEFORE any I/O so the SIGTERM handler sees the correct
-        # process (no window where the old _current_subprocess is targeted).
         _current_subprocess = proc
 
         # Start hang-detection watcher if configured.
@@ -239,18 +265,6 @@ def _init_attempt(
     attempt_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_root / "status.json"
 
-    atomic_write_json(
-        status_path,
-        {
-            "status": "running",
-            "updated_at": now_ts(),
-            "attempt": attempt,
-            "exp_id": exp.get("exp_id"),
-            "cfg_path": exp.get("cfg_path"),
-            "trainer": exp.get("trainer"),
-        },
-    )
-
     exp["attempt"] = attempt
     exp["status"] = "running"
     exp["updated_at"] = now_ts()
@@ -289,7 +303,7 @@ def apply_oom_batch_backoff(exp: Dict[str, Any]) -> bool:
         return False
 
     # Determine current batch size from dict keys.
-    batch_keys = ["batch_size", "per_device_train_batch_size"]
+    batch_keys = ["batch_size", "per_device_train_batch_size", "micro_batch_size"]
     current: int | None = None
     current_key: str | None = None
     for key in batch_keys:
@@ -367,6 +381,23 @@ def ensure_exp_sane(exp: Dict[str, Any]) -> None:
         raise ValueError(f"exp.json missing required keys: {missing}")
     if cmd_type == "bash" and "cmd" not in exp:
         raise ValueError("bash cmd_type requires 'cmd' key")
+    if cmd_type == "bash":
+        # Validate that the script referenced by cmd exists.
+        # Handles both "/path/to/script.sh" and "bash /path/to/script.sh" formats.
+        cmd_parts = shlex.split(exp["cmd"])
+        if cmd_parts:
+            first = Path(cmd_parts[0])
+            # Skip leading shell interpreter (e.g. "bash /path/to/script.sh").
+            if first.name in ("bash", "sh", "zsh") and len(cmd_parts) > 1:
+                if cmd_parts[1] == "-c":
+                    return  # inline command, no script to validate
+                script_path = Path(cmd_parts[1])
+            else:
+                script_path = first
+            if not script_path.is_absolute():
+                script_path = Path.cwd() / script_path
+            if not script_path.exists():
+                raise ValueError(f"bash cmd script not found: {script_path}")
     if "nproc" in exp:
         nproc = int(exp["nproc"])
         if nproc <= 0:
@@ -400,9 +431,12 @@ def _last_error_hash(run_log: Path) -> str:
             if "error_file" in line or "childfailederror" in line:
                 continue
             if "error" in line or "traceback" in line or "exitcode" in line:
-                lines.append(line.strip())
-        # Use last 20 error-bearing lines for a stable hash across DDP ranks
-        # (torchrun may interleave output from different ranks).
+                # Strip per-rank prefixes (e.g. "[rank3]", "[rank0]:") so the
+                # hash is stable across DDP configurations with different GPU
+                # counts — torchrun interleaves per-rank output non-deterministically.
+                stripped = re.sub(r"^\s*\[rank\d+\]\s*:?\s*", "", line.strip())
+                lines.append(stripped)
+        # Use last 20 error-bearing lines for a stable hash.
         return hashlib.md5("\n".join(lines[-20:]).encode(), usedforsecurity=False).hexdigest() if lines else ""
     except Exception:
         return ""
@@ -525,13 +559,15 @@ class RecoveryManager:
         experiment dict.  The caller must write *exp* to disk and call
         ``sys.exit(ctx.rc)``.
 
-        Works on a copy of ``ctx.exp`` so the caller's reference is never
-        mutated — the returned dict is always the authoritative version.
+        Works on a shallow copy of ``ctx.exp`` — top-level keys (status,
+        attempt, etc.) are independent, but nested containers (train_opts dict)
+        are shared with the caller until overwritten.  The returned dict is
+        always the authoritative version.
         """
-        exp = dict(ctx.exp)  # shallow copy — caller uses returned value exclusively
+        exp = dict(ctx.exp)  # shallow copy — top-level keys are independent
 
         # ---- OOM deterministic backoff (before agent) -----------------------
-        if ctx.reason == "oom":
+        if ctx.reason == "oom" and exp.get("oom_batch_candidates"):
             # Save train_opts before apply_oom_batch_backoff mutates it.
             # If backoff succeeds but we have exhausted oom retries, we must
             # roll back the mutation so the stale smaller batch_size doesn't
@@ -569,6 +605,16 @@ class RecoveryManager:
                     )
                     return RecoveryAction.HARD_FAILURE, exp
 
+        # ---- Reset OOM counters on non-OOM failures -----------------------
+        # If the previous failure was OOM but this one is not, the OOM
+        # backoff issues were resolved (manually or by the agent). Reset
+        # counters so future OOMs get a fresh backoff cycle.
+        else:
+            if exp.get("oom_backoff_count") or exp.get("oom_at_min_count"):
+                exp.pop("oom_backoff_count", None)
+                exp.pop("oom_at_min_count", None)
+                exp.pop("last_oom_batch_size", None)
+
         # ---- Agent dispatch (only when retries remain) --------------------
         if ctx.attempt <= int(exp.get("max_retries", 2)):
             agent_fix_hashes = exp.get("agent_fix_hashes", {})
@@ -598,7 +644,7 @@ class RecoveryManager:
                 # First time seeing this error — run the agent.
                 try:
                     snapshot_git(self._repo_root, self._run_root, "pre_agent")
-                    run_agent(
+                    agent_rc = run_agent(
                         self._run_root,
                         repo_root=self._repo_root,
                         timeout_seconds=self._agent_timeout,
@@ -606,6 +652,12 @@ class RecoveryManager:
                         conda_env=exp.get("conda_env", "llm_train"),
                     )
                     snapshot_git(self._repo_root, self._run_root, "post_agent")
+                    if agent_rc != 0:
+                        with open(self._run_root / "agent_error.txt", "a", encoding="utf-8") as f:
+                            f.write(
+                                f"{now_ts()} agent exited non-zero (rc={agent_rc}) — "
+                                f"fixes may be incomplete\n"
+                            )
                     agent_fix_hashes[ctx.error_hash] = int(agent_fix_hashes.get(ctx.error_hash, 0)) + 1
                     # Re-read exp.json so agent edits (train_opts, etc.) are visible.
                     # IMPORTANT: if the re-read fails we keep the old exp AND log a
@@ -618,7 +670,10 @@ class RecoveryManager:
                                 f"{now_ts()} WARNING: failed to re-read exp.json after agent — "
                                 f"agent fixes may be lost: {repr(read_exc)}\n"
                             )
-                    exp["agent_fix_hashes"] = agent_fix_hashes
+                    exp.setdefault("agent_fix_hashes", {}).update(agent_fix_hashes)
+                    # Reset last_failed_at so the retry cooldown starts from
+                    # AFTER the agent fix, not from the original crash time.
+                    exp["last_failed_at"] = str(time.time())
                 except Exception as exc:
                     with open(self._run_root / "agent_error.txt", "a", encoding="utf-8") as f:
                         f.write(f"{now_ts()} {repr(exc)}\n")
@@ -668,16 +723,16 @@ def main() -> None:
         sys.exit(1)
 
     global _worker_lock
+    # Register SIGTERM handler BEFORE acquiring the lock so the handler can
+    # release it even if SIGTERM arrives between lock.acquire() and the
+    # handler registration below.
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     lock = Lock(run_root / ".lock_worker", stale_seconds=12 * 3600)
     if not lock.acquire():
         log_event(source="worker", event="lock_busy", run_root=str(run_root))
         sys.exit(2)
     _worker_lock = lock
-
-    # Ensure GPU processes are killed if the worker receives SIGTERM.
-    # Without this, the training subprocess (start_new_session=True) would be
-    # orphaned when the scheduler kills the conda process group.
-    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     try:
         cmd_type = exp.get("cmd_type", "torchrun")
@@ -760,6 +815,11 @@ def _handle_outcome(ctx: AttemptContext) -> None:
         reason = "interrupted"
     elif ctx.rc == 124:
         reason = "timeout"
+    elif ctx.rc < 0:
+        # Negative exit code = killed by signal (e.g. -9 = SIGKILL, -15 = SIGTERM).
+        # POSIX: exit code = -signum.  Already handled above for 130/124, but
+        # catch other signals (SIGKILL, SIGSEGV, SIGBUS, etc.) here.
+        reason = "killed"
     else:
         reason = classify_failure(ctx.run_log)
     error_hash = _last_error_hash(ctx.run_log)

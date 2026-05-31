@@ -71,6 +71,8 @@ def recover_stale_worker(
                         pass
             return True
         # Case 2: status.json says "running" but worker lock is missing → stale.
+        # The pre-check cleanup (above) already removes dead-PID locks, so a
+        # missing lock at this point means the worker truly is gone.
         if st_status == "running" and not lock_path.exists():
             patch_exp(
                 run_exp_path,
@@ -94,9 +96,15 @@ def recover_stale_worker(
             return True
     except FileNotFoundError:
         pass
+    except (ValueError, OSError):
+        # status.json exists but is malformed (ValueError from json.JSONDecodeError)
+        # or unreadable (OSError). Fall through to Case 3 to attempt recovery
+        # via staleness detection rather than crashing the scheduler loop.
+        pass
 
     # Case 3: No status.json (or could not be read) and no lock after grace period.
     if not lock_path.exists():
+        age = 0.0
         try:
             age = time.time() - status_path.stat().st_mtime
         except FileNotFoundError:
@@ -104,10 +112,17 @@ def recover_stale_worker(
             # If exp was set to "running" >120s ago with no status or lock file,
             # the worker died before creating any artifacts.
             if run_exp_path.exists():
-                age = time.time() - run_exp_path.stat().st_mtime
-            else:
-                age = 0
-        if age > 120:
+                try:
+                    age = time.time() - run_exp_path.stat().st_mtime
+                except FileNotFoundError:
+                    # TOCTOU race: file was deleted between exists() check and
+                    # the stat() call. Treat as if the file never existed.
+                    pass
+        # age == 0 means neither file exists — do NOT recover (the experiment
+        # may not have started yet, or the directory was just created).
+        # 300s grace to allow large-model init (compilation + data loading can
+        # easily take 2+ minutes before any log output or status update).
+        if age > 300 and age > 0:
             stale_attempt = max(curr_attempt, 1)  # preserve attempt counter, floor at 1
             patch_exp(
                 run_exp_path,

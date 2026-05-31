@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from autopipe.config import CONFIG_MERGE_KEYS, default_paths
+from autopipe.config import CONFIG_MERGE_KEYS, Paths, default_paths
 from autopipe.io_utils import Lock, atomic_write_json, log_event, now_ts, patch_exp, read_json
 from autopipe.recovery import recover_stale_worker
 
@@ -21,7 +21,16 @@ def list_queue(queue_dir: Path) -> List[Path]:
 
 
 def load_exp(path: Path) -> Dict[str, Any]:
-    exp = read_json(path)
+    """Load experiment JSON with resilience to corrupted/missing files.
+
+    Returns an empty dict on error so callers can skip entries by checking
+    ``exp_id`` rather than crashing the scheduler loop.
+    """
+    try:
+        exp = read_json(path)
+    except (FileNotFoundError, OSError, ValueError):
+        log_event(source="scheduler", event="load_exp_failed", path=str(path))
+        return {}
     exp.setdefault("status", "pending")
     exp.setdefault("attempt", 0)
     return exp
@@ -33,20 +42,34 @@ def _load_run_exp(queue_exp: Dict[str, Any], run_exp_path: Path) -> Dict[str, An
     - `autopipe/queue/*.json` defines the initial experiment config.
     - `autopipe/runs/<exp_id>/exp.json` is the mutable working copy (agents may edit it).
     - `autopipe/runs/<exp_id>/status.json` is the authoritative last-attempt outcome.
+
+    Applies CONFIG_MERGE_KEYS (new-keys-only via ``setdefault``) so phase 1
+    (stale recovery) sees newly-added queue keys.  Phase 2 applies full
+    overrides (existing keys get hotfixed values) in ``_phase2_spawn_workers``.
     """
     if run_exp_path.exists():
-        exp = read_json(run_exp_path)
+        try:
+            exp = read_json(run_exp_path)
+        except (FileNotFoundError, OSError, ValueError):
+            # TOCTOU guard: the file was deleted between exists() and read,
+            # or it is corrupted (ValueError from json.JSONDecodeError).
+            # Fall back to the queue definition; next iteration will re-read.
+            return dict(queue_exp)
         # Guard: if run exp_id is missing or mismatches, fall back to queue
         # to avoid cross-file contamination.
         run_exp_id = exp.get("exp_id")
         queue_exp_id = queue_exp.get("exp_id")
         if not run_exp_id or run_exp_id != queue_exp_id:
             return dict(queue_exp)
+        # Apply queue-level config updates (hotfix detection).
+        for k in CONFIG_MERGE_KEYS:
+            if k in queue_exp:
+                exp.setdefault(k, queue_exp[k])
         return exp
     return dict(queue_exp)
 
 
-def _phase1_stale_recovery(paths, q: List[Path]) -> int:
+def _phase1_stale_recovery(paths: "Paths", q: List[Path]) -> int:
     """Recover stale workers and return count of healthy 'running' experiments.
 
     For each experiment in *q*:
@@ -57,6 +80,8 @@ def _phase1_stale_recovery(paths, q: List[Path]) -> int:
     running = 0
     for exp_path in q:
         queue_exp = load_exp(exp_path)
+        if not queue_exp.get("exp_id"):
+            continue  # skip corrupted entries
         run_root = paths.runs_dir / queue_exp["exp_id"]
         run_exp_path = run_root / "exp.json"
         exp = _load_run_exp(queue_exp, run_exp_path)
@@ -86,7 +111,7 @@ def _phase1_stale_recovery(paths, q: List[Path]) -> int:
 
 
 def _phase2_spawn_workers(
-    paths,
+    paths: "Paths",
     q: List[Path],
     repo_root: Path,
     running: int,
@@ -100,6 +125,8 @@ def _phase2_spawn_workers(
     """
     for exp_path in q:
         queue_exp = load_exp(exp_path)
+        if not queue_exp.get("exp_id"):
+            continue  # skip corrupted entries
         run_root = paths.runs_dir / queue_exp["exp_id"]
         run_exp_path = run_root / "exp.json"
         exp = _load_run_exp(queue_exp, run_exp_path)
@@ -186,9 +213,17 @@ def _phase2_spawn_workers(
             "--agent-timeout", "600",
         ]
         env = os.environ.copy()
-        ctx_conda = queue_exp.get("conda_env") or exp.get("conda_env")
-        if ctx_conda:
-            cmd = ["conda", "run", "-n", str(ctx_conda), "python", "-m", "autopipe.worker"] + cmd[3:]
+        ctx_conda = queue_exp.get("conda_env")
+        if ctx_conda is None:
+            ctx_conda = exp.get("conda_env")
+        if ctx_conda and isinstance(ctx_conda, str):
+            # Find the positional args (--repo-root and beyond) — avoid
+            # hardcoding cmd[3:] which breaks if the worker invocation changes.
+            try:
+                arg_start = cmd.index("--repo-root")
+            except ValueError:
+                arg_start = 3  # fallback: [python, -m, autopipe.worker, ...]
+            cmd = ["conda", "run", "-n", ctx_conda, "python", "-m", "autopipe.worker"] + cmd[arg_start:]
         log_path = paths.logs_dir / f"scheduler_{exp['exp_id']}.log"
         with open(log_path, "ab", buffering=0) as f:
             f.write(f"\n==== {now_ts()} START {' '.join(cmd)}\n".encode())
@@ -211,20 +246,31 @@ def _parse_time_window(window_str: str) -> Tuple[int, int] | None:
     """Parse HH:MM-HH:MM into (start_minutes, end_minutes) or None.
 
     Example: "22:00-08:00" -> (1320, 480) (overnight window).
+    Returns None for any invalid format (wrong separators, non-numeric values,
+    missing fields, etc.).
     """
-    try:
-        start_str, end_str = window_str.split("-")
-        start_min = int(start_str[:2]) * 60 + int(start_str[3:5])
-        end_min = int(end_str[:2]) * 60 + int(end_str[3:5])
-        if start_min == end_min:
-            return None
-        return start_min, end_min
-    except Exception:
+    import re as _re
+    m = _re.match(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$", window_str.strip())
+    if not m:
         return None
+    try:
+        start_min = int(m.group(1)) * 60 + int(m.group(2))
+        end_min = int(m.group(3)) * 60 + int(m.group(4))
+    except (ValueError, TypeError):
+        return None
+    if start_min == end_min:
+        return None
+    return start_min, end_min
 
 
 def _in_active_window(window: Tuple[int, int] | None) -> bool:
-    """Return True if the current local time falls within *window*. Handles overnight spans."""
+    """Return True if the current local time falls within *window*. Handles overnight spans.
+
+    Uses local system time (``datetime.datetime.now()``) without pytz awareness.
+    For typical overnight scheduling (e.g. "22:00-08:00"), DST transitions are
+    unlikely to cause meaningful issues.  If this function ever needs to handle
+    sub-hour windows or DST-critical schedules, add pytz support.
+    """
     if window is None:
         return True
     start, end = window
@@ -237,11 +283,16 @@ def _in_active_window(window: Tuple[int, int] | None) -> bool:
 
 
 def _terminate_workers(_workers: Dict[str, subprocess.Popen]) -> None:
-    """SIGTERM all running workers for graceful checkpoint-and-exit."""
+    """SIGTERM all running workers for graceful checkpoint-and-exit.
+
+    Uses ``proc.send_signal()`` rather than ``os.killpg()`` because the worker
+    is spawned without ``start_new_session`` and shares the scheduler's process
+    group.  ``killpg`` would send SIGTERM back to the scheduler itself.
+    """
     for eid, proc in list(_workers.items()):
         try:
             if proc.poll() is None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.send_signal(signal.SIGTERM)
         except Exception:
             pass
 
@@ -249,24 +300,33 @@ def _terminate_workers(_workers: Dict[str, subprocess.Popen]) -> None:
 def _kill_workers_signaller(
     _workers: Dict[str, subprocess.Popen], signum: int | None = None, frame: Any = None
 ) -> None:
-    """Best-effort terminate all tracked workers on scheduler shutdown."""
+    """Best-effort terminate all tracked workers on scheduler shutdown.
+
+    Uses ``proc.send_signal()`` not ``os.killpg()`` — see ``_terminate_workers``.
+    """
     for eid, proc in list(_workers.items()):
         try:
             if proc.poll() is None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.send_signal(signal.SIGTERM)
         except Exception:
             pass
-    time.sleep(3)
+    # Sleep in short increments so we can still respond to signals during
+    # the grace period (time.sleep blocks signal delivery).
+    for _ in range(6):
+        alive = any(p.poll() is None for p in _workers.values())
+        if not alive:
+            break
+        time.sleep(0.5)
     for eid, proc in list(_workers.items()):
         try:
             if proc.poll() is None:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.send_signal(signal.SIGKILL)
         except Exception:
             pass
     sys.exit(128 + (signum if signum else signal.SIGTERM))
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--poll-seconds", type=int, default=30)
@@ -379,14 +439,24 @@ def main():
                 if _tick % 10 == 0:
                     rkeys = list(_workers.keys()) if _workers else []
                     done = 0
+                    pending = 0
                     for ep in q:
                         exp = load_exp(ep)
+                        if not exp.get("exp_id"):
+                            continue  # skip corrupted entries
                         rp = paths.runs_dir / exp["exp_id"] / "exp.json"
                         if rp.exists():
-                            st = read_json(rp).get("status", "")
+                            try:
+                                st = read_json(rp).get("status", "")
+                            except (FileNotFoundError, ValueError):
+                                pending += 1
+                                continue
                             if st in ("success", "hard_failure"):
                                 done += 1
-                    pending = len(q) - done - len(rkeys)
+                            elif st in ("pending", "failed"):
+                                pending += 1
+                        else:
+                            pending += 1
                     log_event(source="scheduler", event="heartbeat",
                               running_ids=rkeys if rkeys else [],
                               done=done, total=len(q), pending=pending)

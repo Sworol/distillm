@@ -240,3 +240,114 @@ class TestClassifyFailure:
             "torchrun ChildFailedError: root cause in rank 0\n"
             "RuntimeError: CUDA out of memory")
         assert classify_failure(p) == "oom"
+
+    # ---- Multi-error logs (priority ordering) --------------------------------
+    def test_multi_error_oom_wins_over_disk_full(self, tmp_path: Path) -> None:
+        """When both OOM and disk_full appear, OOM classification wins (higher priority)."""
+        p = write_log(tmp_path, "run.log",
+            "RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+            "OSError: [Errno 28] No space left on device")
+        assert classify_failure(p) == "oom"
+
+    def test_multi_error_nan_wins_over_shape(self, tmp_path: Path) -> None:
+        """NaN classification takes priority over shape mismatch."""
+        p = write_log(tmp_path, "run.log",
+            "loss is nan at step 500\n"
+            "RuntimeError: size mismatch: mat1 and mat2 shapes cannot be multiplied")
+        assert classify_failure(p) == "nan"
+
+    def test_multi_error_loss_scale_wins_over_oom(self, tmp_path: Path) -> None:
+        """loss_scale takes priority over OOM even when both appear."""
+        p = write_log(tmp_path, "run.log",
+            "loss scale cannot decrease below minimum 1.0\n"
+            "CUDA out of memory occurred later")
+        assert classify_failure(p) == "loss_scale"
+
+    # ---- Process killed edge cases ------------------------------------------
+    def test_process_killed_without_oom_context(self, tmp_path: Path) -> None:
+        """'process killed' WITHOUT nearby 'out of memory' -> 'killed'."""
+        p = write_log(tmp_path, "run.log",
+            "process killed by signal 9")
+        assert classify_failure(p) == "killed"
+
+    def test_process_killed_with_oom_proximity_returns_oom(self, tmp_path: Path) -> None:
+        """'process killed' NEAR 'out of memory' -> 'oom' (system OOM killer)."""
+        # The two keywords must be within 500 chars.
+        p = write_log(tmp_path, "run.log",
+            "Out of memory: Killed process 12345 (python) total-vm:64GB")
+        assert classify_failure(p) == "oom"
+
+    # ---- Error in low region of large log ------------------------------------
+    def test_error_in_low_region_of_large_log(self, tmp_path: Path) -> None:
+        """Error in the low (25%) region of a very large log should be detected."""
+        from .conftest import make_log_with_tail
+        # Use make_log_with_tail: body > 512KB, error in body (which is the low region)
+        p = make_log_with_tail(tmp_path, "big_low.log",
+            body="Step 100: loss=2.345 no errors here",
+            tail="ModuleNotFoundError: No module named 'transformers'")
+        # tail is checked for 'import' — the low region covers tail
+        assert classify_failure(p) == "import"
+
+    # ---- Empty log file -----------------------------------------------------
+    def test_whitespace_only_log(self, tmp_path: Path) -> None:
+        """A log with only whitespace/newlines should return 'other'."""
+        p = write_log(tmp_path, "run.log", "  \n  \n  ")
+        assert classify_failure(p) == "other"
+
+    # ---- Signal exit codes --------------------------------------------------
+    def test_sigterm_in_log_classifies_as_killed(self, tmp_path: Path) -> None:
+        """SIGTERM appearing in log should be classified as 'killed'."""
+        p = write_log(tmp_path, "run.log",
+            "Process received SIGTERM, exiting")
+        assert classify_failure(p) == "killed"
+
+    # ---- False-positive edge cases ------------------------------------------
+    def test_loss_scale_and_minimum_in_different_lines_not_false_positive(
+        self, tmp_path: Path
+    ) -> None:
+        """'loss scale' and 'minimum' in different contexts should not match."""
+        p = write_log(tmp_path, "run.log",
+            "WARNING: loss scale is currently 128 -- normal range\n"
+            "RuntimeError: cannot allocate memory for tensor of size 2000\n"
+            "minimum required tensor size is 64\n")
+        # loss_scale WARNING is noise-filtered; minimum alone in error doesn't match
+        assert classify_failure(p) != "loss_scale"
+
+    def test_oom_without_cuda_or_proximity_not_false_positive(self, tmp_path: Path) -> None:
+        """'out of memory' without CUDA context should not be classified as 'oom' unless
+        it appears with 'killed' in proximity."""
+        p = write_log(tmp_path, "run.log",
+            "the process reported out of memory on line 42\n"
+            "this was a diagnostic message not an actual OOM\n")
+        assert classify_failure(p) != "oom"
+
+    def test_nccl_mentioned_in_warning_without_error_not_false_positive(
+        self, tmp_path: Path
+    ) -> None:
+        """NCCL in a WARNING line without actual error should not trigger nccl."""
+        p = write_log(tmp_path, "run.log",
+            "[rank0]:WARNING: NCCL version 2.18.1 initialized\n"
+            "RuntimeError: address already in use\n")
+        # The WARNING is filtered (no error keywords), so "nccl" doesn't appear in text
+        assert classify_failure(p) == "port"
+
+    def test_import_error_phrase_without_importerror(self, tmp_path: Path) -> None:
+        """'import error' (two separate words) does not match 'importerror' or
+        'modulenotfounderror'."""
+        p = write_log(tmp_path, "run.log",
+            "import error: could not resolve module 'torch'\n")
+        assert classify_failure(p) != "import"
+
+    def test_nan_without_relevant_context_not_false_positive(self, tmp_path: Path) -> None:
+        """A file named 'nan' or 'banana' should not trigger NaN detection."""
+        p = write_log(tmp_path, "run.log",
+            "FileNotFoundError: cannot find /data/banana_file.txt\n")
+        assert classify_failure(p) != "nan"
+        assert classify_failure(p) == "path"
+
+    def test_warning_containing_error_keyword_not_filtered(self, tmp_path: Path) -> None:
+        """WARNING lines containing error-level keywords are kept for classification."""
+        p = write_log(tmp_path, "run.log",
+            "[rank2]:WARNING: NCCL timeout detected in AllReduce\n"
+            "INFO: continuing training\n")
+        assert classify_failure(p) == "nccl"

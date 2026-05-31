@@ -12,13 +12,29 @@ HARD_FAILURE_THRESHOLD = 3
 # per-experiment working copy.  Bookkeeping fields (attempt, status,
 # updated_at, last_reason, error_hash, etc.) and train_opts are intentionally
 # excluded — the agent edits train_opts and merges would clobber those fixes.
-CONFIG_MERGE_KEYS: frozenset[str] = frozenset([
-    "cfg_path", "trainer", "cmd", "cmd_type", "key", "conda_env",
-    "gpus", "nproc", "master_port", "hf_endpoint",
-    "train_timeout", "hang_timeout", "vis_timeout", "vis_opts",
-    "skip_vis", "retry_sleep", "oom_batch_candidates",
-    "max_retries", "agent_cli", "hard_failure_threshold",
-])
+# Sorted tuple for deterministic iteration order across all Python runs.
+# Previously a frozenset, whose iteration order can vary between processes.
+CONFIG_MERGE_KEYS: tuple[str, ...] = (
+    "agent_cli",
+    "cfg_path",
+    "cmd",
+    "cmd_type",
+    "conda_env",
+    "gpus",
+    "hang_timeout",
+    "hard_failure_threshold",
+    "hf_endpoint",
+    "key",
+    "master_port",
+    "max_oom_retries",
+    "max_retries",
+    "nproc",
+    "oom_batch_candidates",
+    "retry_sleep",
+    "skip_vis",
+    "train_timeout",
+    "trainer",
+)
 
 
 @dataclass(frozen=True)
