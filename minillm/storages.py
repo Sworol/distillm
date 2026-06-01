@@ -113,55 +113,55 @@ class PPORolloutStorage(BaseRolloutStore):
         return PPORLBatch(
             # Left padding of already left-padded queries
             pad_sequence(
-                [elem.query_tensor.flip(0) for elem in elems],
+                [elem.query_tensor.cpu().flip(0) for elem in elems],
                 padding_value=self.pad_token_id,
                 batch_first=True,
             ).flip(1),
             # Right pad the rest, to have a single horizontal query/response split
             pad_sequence(
-                [elem.response_tensor for elem in elems],
+                [elem.response_tensor.cpu() for elem in elems],
                 padding_value=self.pad_token_id,
                 batch_first=True,
             ),
             torch.tensor([elem.lens for elem in elems], dtype=torch.long),
             torch.tensor([elem.s_lens for elem in elems], dtype=torch.long),
             pad_sequence(
-                [elem.mask for elem in elems],
-                padding_value=0.0,
-                batch_first=True,
-            ),            
-            pad_sequence(
-                [elem.logprobs for elem in elems],
+                [elem.mask.cpu() for elem in elems],
                 padding_value=0.0,
                 batch_first=True,
             ),
             pad_sequence(
-                [elem.rewards for elem in elems],
+                [elem.logprobs.cpu() for elem in elems],
                 padding_value=0.0,
                 batch_first=True,
             ),
             pad_sequence(
-                [elem.rev_kl for elem in elems],
+                [elem.rewards.cpu() for elem in elems],
                 padding_value=0.0,
                 batch_first=True,
             ),
             pad_sequence(
-                [elem.w for elem in elems],
+                [elem.rev_kl.cpu() for elem in elems],
                 padding_value=0.0,
                 batch_first=True,
             ),
             pad_sequence(
-                [elem.inf_mask for elem in elems],
+                [elem.w.cpu() for elem in elems],
+                padding_value=0.0,
+                batch_first=True,
+            ),
+            pad_sequence(
+                [elem.inf_mask.cpu() for elem in elems],
                 padding_value=0,
                 batch_first=True,
             ),
             pad_sequence(
-                [elem.t_rewards for elem in elems],
+                [elem.t_rewards.cpu() for elem in elems],
                 padding_value=0.0,
                 batch_first=True,
             ),
             pad_sequence(
-                [elem.ent_rewards for elem in elems],
+                [elem.ent_rewards.cpu() for elem in elems],
                 padding_value=0.0,
                 batch_first=True,
             ),
