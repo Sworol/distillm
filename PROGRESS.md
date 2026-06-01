@@ -139,22 +139,22 @@ On worker-detected failure that can't be handled by OOM-reduction:
 - `train_opts` from exp.json exported as `TRAIN_{KEY_UPPER}` env vars
 - `HF_ENDPOINT=https://hf-mirror.com` for model downloads in China
 
-### Queue (sequential execution)
+### Queue (Jun 1 ~10:00)
 
-| # | Task | Script | GPUs | Est. Time | Status |
-|---|------|--------|------|-----------|--------|
-| 1 | KD train | `scripts/run_kd_multitask.sh` | 0-3 | ~2-3h | success |
-| 2 | KD eval | `scripts/run_eval_kd_multitask.sh` | 0 | ~1h | success |
-| 3 | SeqKD gen | `scripts/gpt2/tools/generate_data_seqkd_multitask.sh` | 0-3 | ~1.5h | success |
-| 4 | SeqKD process | `scripts/process_seqkd_data.sh` | CPU | ~10min | success |
-| 5 | SeqKD train | `scripts/gpt2/seqkd/seqkd_multitask_base.sh` | 0-3 | ~12h | running (attempt 5/5, epoch 0, iter ~500) |
-| 6 | SeqKD eval | `scripts/run_eval_seqkd_multitask.sh` | 0 | ~1h | failed (dependency: needs seqkd_train ckpt) |
-| 7 | MiniLLM train | `scripts/gpt2/minillm/train_multitask_base_xl.sh` | 0-3 | ~10-20h | failed (killed, attempt 2, agent fixed model_kwargs) |
-| 8 | MiniLLM eval | `scripts/run_eval_minillm_multitask.sh` | 0 | ~1h | failed (needs minillm_train) |
-| 9 | DistiLLM train | `scripts/run_distillm_multitask.sh` | 0-3 | ~5-8h | pending |
-| 10 | DistiLLM eval | `scripts/run_eval_multitask_student.sh` | 0 | ~1h | pending |
+| # | Task | Status |
+|---|------|--------|
+| 1 | KD train | success |
+| 2 | KD eval | success |
+| 3 | SeqKD gen | success |
+| 4 | SeqKD process | success |
+| 5 | SeqKD train | success (attempt 6, from scratch ~5.7h) |
+| 6 | SeqKD eval | success |
+| 7 | MiniLLM train | failed (4-round agent repair done, awaits retry) |
+| 8 | MiniLLM eval | failed (depends on minillm_train) |
+| 9 | **DistiLLM train** | **running** (epoch 17/20, iter 8020/9300, ~86%) |
+| 10 | DistiLLM eval | pending |
 
-Total completed so far: 4/10. seqkd_train at 141K steps × 20 epochs → estimated ~12h remaining.
+Completed: 7/10. distillm_train ~10-15 min remaining, then minillm_train auto-retries.
 
 ### Data status
 
@@ -177,8 +177,10 @@ Total completed so far: 4/10. seqkd_train at 141K steps × 20 epochs → estimat
 | seqkd_train | 1-4 | Prompt overflow (368 > max_prompt_length=256) | Truncate prompt at lm_datasets.py:74 |
 | seqkd_train | 4 | Disk full: PyTorch checkpoint write failed | classifies as disk_full now; scheduler tolerates OSError |
 | minillm_train | 2 | `ValueError: mix_in_model` in generate() | Pop unrecognized kwargs before model.generate() (HF >=4.x validation) |
+| minillm_train | 3 | CUDA init error in DataLoader (empty fix) | Agent ran but produced no effective diff |
+| minillm_train | 4 | `RuntimeError: CUDA error: initialization error` in `storages.py:collate()` | Added `.cpu()` to 10 tensor attrs in PPORolloutStorage.collate() — DataLoader fork workers can't use GPU tensors in pad_sequence |
 | minillm_eval | 1 | Dependency: no minillm checkpoint yet | Will auto-resolve once minillm_train succeeds |
-| seqkd_eval | 1-3 | Dependency: no seqkd checkpoint yet | Will auto-resolve once seqkd_train succeeds |
+| seqkd_eval | 1-3 | Dependency/SIGTERM | Auto-resolved after seqkd_train success |
 
 ### Autopipe Bug Fixes & Improvements
 
@@ -195,6 +197,9 @@ Total completed so far: 4/10. seqkd_train at 141K steps × 20 epochs → estimat
 11. **Time-window scheduling**: `--active-window 22:00-08:00` + `--window-kill` for overnight training.
 12. **Heartbeat**: Every 10 poll cycles prints `running=X done=Y/Z pending=W` summary.
 13. **Scheduler disk-full resilience**: Main loop wrapped in `try/except OSError` + pre-I/O disk check (<1GB skips spawn). Prevents scheduler crash on full disk; worker cleanup runs normally.
+14. **Checkpoint Resume (`--load`)**: `utils.py:get_model()` now supports `--load` to resume from a prior training directory. Auto-discovers latest step checkpoint by scanning numeric subdirectories, validates `pytorch_model.bin` size (>100MB). `worker.py` exports `AUTOPIPE_LOAD_PATH` from `train_opts.load_path`. Only loads model weights (not optimizer state) — best for eval or weight init.
+15. **Phase 1 stale lock fix**: Empty/corrupt `.lock_worker` files (0 bytes, no PID) now cleaned up. Changed condition from `pid is not None` to `pid is None` — prevents infinite `lock_busy` retry loops when worker fails before writing PID.
+16. **MiniLLM DataLoader CUDA fix** (`minillm/storages.py`): Agent added `.cpu()` to all 10 tensor attributes in `PPORolloutStorage.collate()` — `pad_sequence()` was called on GPU tensors inside forked DataLoader workers that don't have CUDA initialized.
 
 ### Data status
 
